@@ -42,8 +42,8 @@ bench: $(BIN)
 
 bench-ci: $(BIN)
 	@echo "Running CI benchmark"
-	@LL_STOP_AFTER_ONE=1 ./$(BIN) $(BENCH_START_INDEX) 1
-	@LL_STOP_AFTER_ONE=1 ./$(BIN) $(BENCH_START_INDEX) 0
+	@LL_STOP_AFTER_ONE=0 ./$(BIN) $(BENCH_START_INDEX) 1
+	@LL_STOP_AFTER_ONE=0 ./$(BIN) $(BENCH_START_INDEX) 0
 
 clean:
 	rm -rf bin
