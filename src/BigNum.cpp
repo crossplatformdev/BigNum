@@ -42,6 +42,10 @@
 #include <utility>
 #include <vector>
 #include <boost/multiprecision/cpp_int.hpp>
+#include <cerrno>
+#include <ctime>
+#include <fstream>
+#include <sys/stat.h>
 #include <sched.h>
 
 // ============================================================
@@ -167,6 +171,76 @@ inline std::vector<std::vector<uint32_t>> precharge_work_matrix(
         if (++slot >= threads) slot = 0u;
     }
     return work_matrix;
+}
+
+// Returns true if p is in the known Mersenne prime exponent list.
+inline bool is_known_mersenne_prime(uint32_t p) {
+    const auto& known = known_mersenne_prime_exponents();
+    return std::binary_search(known.begin(), known.end(), p);
+}
+
+// Generate all prime exponents p such that min_excl < p <= max_incl.
+// Returns results in ascending order.  Uses trial division via
+// is_prime_exponent(); iterates only odd candidates for efficiency.
+inline std::vector<uint32_t> generate_post_known_exponents(
+    uint32_t min_excl, uint32_t max_incl)
+{
+    std::vector<uint32_t> result;
+    if (max_incl <= min_excl) return result;
+    uint32_t start = min_excl + 1u;
+    // Skip even numbers > 2.
+    if (start > 2u && (start & 1u) == 0u) ++start;
+    for (uint32_t p = start; p <= max_incl; p += (p == 2u ? 1u : 2u)) {
+        if (is_prime_exponent(p)) result.push_back(p);
+    }
+    return result;
+}
+
+// Discover-mode exponent list:
+//   1. single_exp first (if non-zero and prime),
+//   2. all prime p: min_excl < p <= max_incl (single_exp deduplicated),
+//   3. optionally reversed (range part only),
+//   4. optionally sharded (range part only; single_exp always included).
+inline std::vector<uint32_t> discover_exponent_list(
+    uint32_t single_exp,
+    uint32_t min_excl,
+    uint32_t max_incl,
+    bool     reverse_order = false,
+    uint32_t shard_count   = 1u,
+    uint32_t shard_index   = 0u)
+{
+    if (shard_count == 0u) shard_count = 1u;
+    if (shard_index >= shard_count) shard_index = 0u;
+
+    // Generate exploration range.
+    std::vector<uint32_t> range = generate_post_known_exponents(min_excl, max_incl);
+
+    // Deduplicate: remove single_exp from range if it falls inside.
+    if (single_exp != 0u) {
+        range.erase(std::remove(range.begin(), range.end(), single_exp), range.end());
+    }
+
+    // Apply shard selection to the range part.
+    if (shard_count > 1u) {
+        std::vector<uint32_t> shard;
+        shard.reserve(range.size() / shard_count + 1u);
+        for (size_t i = 0; i < range.size(); ++i) {
+            if (static_cast<uint32_t>(i % shard_count) == shard_index)
+                shard.push_back(range[i]);
+        }
+        range = std::move(shard);
+    }
+
+    // Optionally reverse the range (largest-first scheduling).
+    if (reverse_order) std::reverse(range.begin(), range.end());
+
+    // Build result: explicit exponent first, then range.
+    std::vector<uint32_t> result;
+    result.reserve((single_exp != 0u ? 1u : 0u) + range.size());
+    if (single_exp != 0u && is_prime_exponent(single_exp))
+        result.push_back(single_exp);
+    result.insert(result.end(), range.begin(), range.end());
+    return result;
 }
 
 }  // namespace mersenne
@@ -1019,6 +1093,427 @@ bool lucas_lehmer(uint32_t p, bool progress, bool benchmark_mode = false) {
 // ============================================================
 #ifndef BIGNUM_NO_MAIN
 
+// ---- Discover-mode infrastructure ----
+
+// UTF-8 discovery banner prefix (fire+siren emoji: 🚨).
+static constexpr const char* kDiscoveryEmoji = "\xF0\x9F\x9A\xA8";
+
+// Format current UTC time as ISO-8601 string into buf[32].
+// Returns buf, or "unknown" if gmtime fails.
+static const char* iso_timestamp_now(char buf[32]) {
+    std::time_t now = std::time(nullptr);
+    struct tm* tm_utc = std::gmtime(&now);
+    if (!tm_utc) {
+        std::snprintf(buf, 32, "unknown");
+        return buf;
+    }
+    std::strftime(buf, 32, "%Y-%m-%dT%H:%M:%SZ", tm_utc);
+    return buf;
+}
+
+struct DiscoverResult {
+    uint32_t    exponent{0};
+    bool        is_prime{false};
+    bool        is_known{false};
+    bool        is_new_discovery{false};
+    bool        is_explicit_first{false};
+    double      elapsed_sec{0.0};
+    unsigned    threads{1};
+    uint32_t    shard_index{0};
+    uint32_t    shard_count{1};
+    std::string backend_name;
+};
+
+// Return the backend name that lucas_lehmer() would select for exponent p.
+static std::string discover_backend_name(uint32_t p) {
+    if (p < 128u) return "GenericBackend";
+    const char* env = std::getenv("LL_LIMB_FFT_CROSSOVER");
+    uint32_t crossover = 4000u;
+    if (env && *env) {
+        char* end = nullptr;
+        const long v = std::strtol(env, &end, 10);
+        if (end != env && *end == '\0' && v > 0 && v < 1000000L)
+            crossover = static_cast<uint32_t>(v);
+    }
+    return p < crossover ? "LimbBackend" : "FftMersenneBackend";
+}
+
+static void write_discover_csv(
+    const std::string& path,
+    const std::vector<DiscoverResult>& results)
+{
+    std::ofstream f(path);
+    if (!f) { std::fprintf(stderr, "Cannot write CSV: %s\n", path.c_str()); return; }
+    f << "exponent,result,backend,elapsed_sec,threads,mode,"
+         "shard_index,shard_count,is_explicit_first,is_new_discovery\n";
+    for (const auto& r : results) {
+        char ebuf[32];
+        std::snprintf(ebuf, sizeof(ebuf), "%.6f", r.elapsed_sec);
+        f << r.exponent << ","
+          << (r.is_prime ? "prime" : "composite") << ","
+          << r.backend_name << ","
+          << ebuf << ","
+          << r.threads << ","
+          << "discover,"
+          << r.shard_index << ","
+          << r.shard_count << ","
+          << (r.is_explicit_first ? "1" : "0") << ","
+          << (r.is_new_discovery ? "1" : "0") << "\n";
+    }
+}
+
+static void write_discover_json(
+    const std::string& path,
+    const std::vector<DiscoverResult>& results,
+    uint32_t single_exp, uint32_t min_excl, uint32_t max_incl,
+    uint32_t shard_index, uint32_t shard_count,
+    const std::string& run_url)
+{
+    std::ofstream f(path);
+    if (!f) { std::fprintf(stderr, "Cannot write JSON: %s\n", path.c_str()); return; }
+
+    char tbuf[32];
+    iso_timestamp_now(tbuf);
+
+    const char* sha = std::getenv("GITHUB_SHA");
+    if (!sha || !*sha) sha = "";
+
+    f << "{\n"
+      << "  \"mode\": \"discover\",\n"
+      << "  \"single_exponent\": " << single_exp << ",\n"
+      << "  \"min_excl\": " << min_excl << ",\n"
+      << "  \"max_incl\": " << max_incl << ",\n"
+      << "  \"shard_index\": " << shard_index << ",\n"
+      << "  \"shard_count\": " << shard_count << ",\n"
+      << "  \"timestamp\": \"" << tbuf << "\",\n"
+      << "  \"commit_sha\": \"" << sha << "\",\n"
+      << "  \"workflow_run_url\": \"" << run_url << "\",\n"
+      << "  \"results\": [\n";
+
+    for (size_t i = 0; i < results.size(); ++i) {
+        const auto& r = results[i];
+        char ebuf[32];
+        std::snprintf(ebuf, sizeof(ebuf), "%.6f", r.elapsed_sec);
+        f << "    {\n"
+          << "      \"exponent\": " << r.exponent << ",\n"
+          << "      \"result\": \"" << (r.is_prime ? "prime" : "composite") << "\",\n"
+          << "      \"backend\": \"" << r.backend_name << "\",\n"
+          << "      \"elapsed_sec\": " << ebuf << ",\n"
+          << "      \"threads\": " << r.threads << ",\n"
+          << "      \"shard_index\": " << r.shard_index << ",\n"
+          << "      \"shard_count\": " << r.shard_count << ",\n"
+          << "      \"is_explicit_first\": " << (r.is_explicit_first ? "true" : "false") << ",\n"
+          << "      \"is_known_mersenne_prime\": " << (r.is_known ? "true" : "false") << ",\n"
+          << "      \"is_new_discovery\": " << (r.is_new_discovery ? "true" : "false") << "\n"
+          << "    }" << (i + 1 < results.size() ? "," : "") << "\n";
+    }
+    f << "  ]\n}\n";
+}
+
+static void write_discovery_event_json(
+    const std::string& path,
+    uint32_t exponent,
+    double elapsed_sec,
+    uint32_t shard_index,
+    uint32_t shard_count,
+    const std::string& run_url)
+{
+    std::ofstream f(path);
+    if (!f) { std::fprintf(stderr, "Cannot write discovery event JSON: %s\n", path.c_str()); return; }
+
+    char tbuf[32];
+    iso_timestamp_now(tbuf);
+
+    const char* sha = std::getenv("GITHUB_SHA");
+    if (!sha || !*sha) sha = "";
+
+    char ebuf[32];
+    std::snprintf(ebuf, sizeof(ebuf), "%.6f", elapsed_sec);
+
+    f << "{\n"
+      << "  \"event\": \"NEW_MERSENNE_PRIME_FOUND\",\n"
+      << "  \"exponent\": " << exponent << ",\n"
+      << "  \"timestamp\": \"" << tbuf << "\",\n"
+      << "  \"commit_sha\": \"" << sha << "\",\n"
+      << "  \"workflow_run_url\": \"" << run_url << "\",\n"
+      << "  \"elapsed_sec\": " << ebuf << ",\n"
+      << "  \"shard_index\": " << shard_index << ",\n"
+      << "  \"shard_count\": " << shard_count << "\n"
+      << "}\n";
+}
+
+// Emit a loud, multi-channel discovery notification.
+static void emit_discovery_notification(uint32_t p, const std::string& run_url) {
+    // GitHub Actions workflow commands produce annotations in the UI.
+    std::printf("::notice title=NEW MERSENNE PRIME FOUND::M_%u is prime! "
+                "Exponent %u not in known list. Run: %s\n",
+                p, p, run_url.c_str());
+    std::printf("::warning title=NEW MERSENNE PRIME FOUND::M_%u verified prime "
+                "by Lucas-Lehmer. Exponent %u unknown to the known list.\n",
+                p, p);
+
+    // Prominent console banner.
+    std::printf("\n");
+    std::printf("*************************************************************\n");
+    std::printf("***                                                       ***\n");
+    std::printf("***   NEW MERSENNE PRIME CANDIDATE: M_%-18u   ***\n", p);
+    std::printf("***   Exponent %u NOT in known Mersenne list!        ***\n", p);
+    std::printf("***   VERIFY INDEPENDENTLY BEFORE ANNOUNCING!            ***\n");
+    std::printf("***                                                       ***\n");
+    std::printf("*************************************************************\n");
+    std::printf("\n");
+
+    // Append to GitHub Actions step summary if the env var is set.
+    const char* summary_path = std::getenv("GITHUB_STEP_SUMMARY");
+    if (summary_path && *summary_path) {
+        std::ofstream sf(summary_path, std::ios::app);
+        if (sf) {
+            sf << "\n## " << kDiscoveryEmoji << " NEW MERSENNE PRIME FOUND: M_" << p << "\n\n"
+               << "| Field | Value |\n"
+               << "|-------|-------|\n"
+               << "| Exponent | " << p << " |\n"
+               << "| Status | **NOT** in the known Mersenne prime list |\n"
+               << "| Workflow run | " << run_url << " |\n\n"
+               << "> \xE2\x9A\xA0\xEF\xB8\x8F Independent verification required before any announcement.\n\n";
+        }
+    }
+    std::fflush(stdout);
+}
+
+// Parse an unsigned integer from an environment variable.
+// Returns def if the variable is unset/empty/invalid.
+static uint32_t env_uint32(const char* name, uint32_t def) {
+    const char* s = std::getenv(name);
+    if (!s || !*s) return def;
+    char* end = nullptr;
+    const unsigned long v = std::strtoul(s, &end, 10);
+    if (end == s || *end != '\0') {
+        std::fprintf(stderr, "Invalid %s='%s'; using default %u\n", name, s, def);
+        return def;
+    }
+    return static_cast<uint32_t>(v);
+}
+
+static bool env_bool(const char* name, bool def = false) {
+    const char* s = std::getenv(name);
+    if (!s || !*s) return def;
+    return std::strcmp(s, "1") == 0 || std::strcmp(s, "true") == 0 ||
+           std::strcmp(s, "yes") == 0;
+}
+
+// Discover-mode entry point (called from main when LL_SWEEP_MODE=discover).
+static int run_discover_mode(int argc, char** argv) {
+    const unsigned maxCores = runtime::detect_available_cores();
+
+    // --- Parse parameters (env vars, then argv override for threads) ---
+    const uint32_t single_exp   = env_uint32("LL_SINGLE_EXPONENT", 0u);
+    const uint32_t min_excl     = env_uint32("LL_MIN_EXPONENT",  136279841u);
+    const uint32_t max_incl     = env_uint32("LL_MAX_EXPONENT",  200000000u);
+    const uint32_t shard_count  = env_uint32("LL_SHARD_COUNT",   1u);
+    const uint32_t shard_index  = env_uint32("LL_SHARD_INDEX",   0u);
+    const uint32_t stop_after_n = env_uint32("LL_STOP_AFTER_N_CASES", 0u);
+    const bool reverse_order    = env_bool("LL_REVERSE_ORDER");
+    const bool dry_run          = env_bool("LL_DRY_RUN");
+    const bool progress         = env_bool("LL_PROGRESS");
+
+    unsigned threads = maxCores;
+    if (argc >= 3 && argv[2] && argv[2][0] != '\0') {
+        const unsigned req = static_cast<unsigned>(std::strtoull(argv[2], nullptr, 10));
+        threads = (req == 0u) ? maxCores : std::min(req, maxCores);
+    } else {
+        const uint32_t req = env_uint32("LL_THREADS", 0u);
+        threads = (req == 0u) ? maxCores : std::min(static_cast<unsigned>(req), maxCores);
+    }
+
+    // Construct workflow run URL from GitHub Actions env vars.
+    const char* server_url = std::getenv("GITHUB_SERVER_URL");
+    const char* repo       = std::getenv("GITHUB_REPOSITORY");
+    const char* run_id     = std::getenv("GITHUB_RUN_ID");
+    std::string run_url;
+    if (server_url && *server_url && repo && *repo && run_id && *run_id)
+        run_url = std::string(server_url) + "/" + repo + "/actions/runs/" + run_id;
+
+    // Output directory (defaults to current directory).
+    const char* out_dir_env = std::getenv("LL_OUTPUT_DIR");
+    std::string out_dir;
+    if (out_dir_env && *out_dir_env) {
+        out_dir = out_dir_env;
+        // Ensure trailing slash.
+        if (out_dir.back() != '/') out_dir += '/';
+        // Create directory; ignore EEXIST, warn on other errors.
+        if (::mkdir(out_dir.c_str(), 0755) != 0 && errno != EEXIST) {
+            std::fprintf(stderr,
+                "Warning: cannot create output directory '%s': %s\n",
+                out_dir.c_str(), std::strerror(errno));
+        }
+    }
+
+    // --- Generate exponent list ---
+    const std::vector<uint32_t> exps = mersenne::discover_exponent_list(
+        single_exp, min_excl, max_incl, reverse_order, shard_count, shard_index);
+
+    // --- Print plan ---
+    std::printf("=== DISCOVER MODE ===\n");
+    std::printf("  single_exponent  : %u\n", single_exp);
+    std::printf("  min_excl         : %u\n", min_excl);
+    std::printf("  max_incl         : %u\n", max_incl);
+    std::printf("  shard            : %u/%u\n", shard_index, shard_count);
+    std::printf("  reverse_order    : %s\n", reverse_order ? "yes" : "no");
+    std::printf("  stop_after_n     : %u\n", stop_after_n);
+    std::printf("  exponents_in_list: %zu\n", exps.size());
+    std::printf("  threads          : %u / %u available\n", threads, maxCores);
+    std::printf("  dry_run          : %s\n", dry_run ? "yes" : "no");
+    if (!run_url.empty())
+        std::printf("  workflow_run     : %s\n", run_url.c_str());
+    std::printf("\n");
+
+    if (dry_run) {
+        std::printf("DRY RUN: exponent plan (%zu items):\n", exps.size());
+        for (size_t i = 0; i < exps.size(); ++i) {
+            const bool first = (single_exp != 0u && i == 0u && exps[i] == single_exp);
+            std::printf("  [%zu] p=%-10u  backend=%-20s  %s\n",
+                        i, exps[i],
+                        discover_backend_name(exps[i]).c_str(),
+                        first ? "(explicit first)" : "");
+        }
+        return 0;
+    }
+
+    if (exps.empty()) {
+        std::printf("No exponents to test in discover mode. "
+                    "Check LL_SINGLE_EXPONENT / LL_MAX_EXPONENT range.\n");
+        return 0;
+    }
+
+    // --- Run exponents ---
+    std::vector<DiscoverResult> results;
+    results.reserve(exps.size());
+
+    bool any_new_discovery = false;
+    uint32_t tested = 0u;
+
+    for (size_t i = 0; i < exps.size(); ++i) {
+        if (stop_after_n != 0u && tested >= stop_after_n) {
+            std::printf("Stopping after %u cases (LL_STOP_AFTER_N_CASES).\n", stop_after_n);
+            break;
+        }
+        const uint32_t p = exps[i];
+        const bool is_first = (single_exp != 0u && i == 0u && p == single_exp);
+
+        std::printf("Testing M_%u ...%s\n", p, is_first ? " [explicit first exponent]" : "");
+
+        const auto t0     = std::chrono::steady_clock::now();
+        const bool isPrime = mersenne::lucas_lehmer(p, progress, /*benchmark_mode=*/false);
+        const auto t1     = std::chrono::steady_clock::now();
+        const double elapsed = std::chrono::duration<double>(t1 - t0).count();
+
+        const bool is_known = mersenne::is_known_mersenne_prime(p);
+        const bool is_new   = isPrime && !is_known;
+
+        std::printf("M_%u is %s. Time: %.3f s%s\n",
+                    p, isPrime ? "prime" : "composite", elapsed,
+                    is_new ? "  *** NEW DISCOVERY ***" : "");
+
+        DiscoverResult r;
+        r.exponent         = p;
+        r.is_prime         = isPrime;
+        r.is_known         = is_known;
+        r.is_new_discovery = is_new;
+        r.is_explicit_first = is_first;
+        r.elapsed_sec      = elapsed;
+        r.threads          = threads;
+        r.shard_index      = shard_index;
+        r.shard_count      = shard_count;
+        r.backend_name     = discover_backend_name(p);
+        results.push_back(r);
+
+        ++tested;
+
+        if (is_new) {
+            any_new_discovery = true;
+            emit_discovery_notification(p, run_url);
+            write_discovery_event_json(
+                out_dir + "discovery_event.json",
+                p, elapsed, shard_index, shard_count, run_url);
+        }
+    }
+
+    // --- Write result files ---
+    write_discover_csv(out_dir + "discover_results.csv", results);
+    write_discover_json(out_dir + "discover_results.json", results,
+                        single_exp, min_excl, max_incl,
+                        shard_index, shard_count, run_url);
+
+    // --- Write workflow summary ---
+    {
+        std::ofstream sf(out_dir + "discover_workflow_summary.md");
+        if (sf) {
+            sf << "# Discover Mode Summary\n\n"
+               << "| Parameter | Value |\n"
+               << "|-----------|-------|\n"
+               << "| single_exponent | " << single_exp << " |\n"
+               << "| min_excl | " << min_excl << " |\n"
+               << "| max_incl | " << max_incl << " |\n"
+               << "| shard | " << shard_index << " / " << shard_count << " |\n"
+               << "| exponents tested | " << tested << " |\n"
+               << "| threads | " << threads << " |\n"
+               << "| new discoveries | " << (any_new_discovery ? "YES" : "none") << " |\n\n";
+
+            // Per-exponent table (only if not too long).
+            if (results.size() <= 200) {
+                sf << "## Results\n\n"
+                   << "| Exponent | Result | Backend | Elapsed (s) | New? |\n"
+                   << "|----------|--------|---------|-------------|------|\n";
+                for (const auto& r : results) {
+                    char ebuf[32];
+                    std::snprintf(ebuf, sizeof(ebuf), "%.3f", r.elapsed_sec);
+                    sf << "| " << r.exponent
+                       << " | " << (r.is_prime ? "prime" : "composite")
+                       << " | " << r.backend_name
+                       << " | " << ebuf
+                       << " | " << (r.is_new_discovery ? "**YES**" : "no") << " |\n";
+                }
+                sf << "\n";
+            }
+
+            if (any_new_discovery) {
+                sf << "## " << kDiscoveryEmoji << " New Discoveries\n\n";
+                for (const auto& r : results) {
+                    if (r.is_new_discovery)
+                        sf << "- **M_" << r.exponent << "** is a new Mersenne prime candidate!\n";
+                }
+                sf << "\n";
+            }
+
+            if (!run_url.empty())
+                sf << "**Workflow run:** " << run_url << "\n";
+        }
+
+        // Also append to GitHub Actions step summary if available.
+        const char* summary_path = std::getenv("GITHUB_STEP_SUMMARY");
+        if (summary_path && *summary_path) {
+            std::ofstream gsf(summary_path, std::ios::app);
+            if (gsf) {
+                gsf << "## Discover Mode Results\n\n"
+                    << "- Exponents tested: " << tested << "\n"
+                    << "- Range: " << min_excl << " < p <= " << max_incl << "\n"
+                    << "- Shard: " << shard_index << " / " << shard_count << "\n"
+                    << "- New discoveries: " << (any_new_discovery ? "**YES**" : "none") << "\n\n";
+                if (!run_url.empty())
+                    gsf << "Workflow run: " << run_url << "\n\n";
+            }
+        }
+    }
+
+    std::printf("\nDiscover mode complete. Tested %u exponent(s).\n", tested);
+    if (any_new_discovery) {
+        std::printf("NEW DISCOVERIES FOUND — see discovery_event.json and discover_results.json\n");
+        return 3;  // distinct exit code for discovery
+    }
+    return 0;
+}
+
+
 static bool test_exponent(uint32_t p, bool progress, bool benchmark_mode) {
     std::printf("Testing M_%u ...\n", p);
     const auto t0     = std::chrono::steady_clock::now();
@@ -1032,6 +1527,13 @@ static bool test_exponent(uint32_t p, bool progress, bool benchmark_mode) {
 
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
+
+    // Dispatch to discover mode when LL_SWEEP_MODE=discover.
+    {
+        const char* sweep_mode = std::getenv("LL_SWEEP_MODE");
+        if (sweep_mode && std::strcmp(sweep_mode, "discover") == 0)
+            return run_discover_mode(argc, argv);
+    }
 
     const unsigned maxCores = runtime::detect_available_cores();
 

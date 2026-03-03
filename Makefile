@@ -12,7 +12,7 @@ PROF_BIN := bin/bignum_prof
 PROF_CXXFLAGS := -std=c++20 -O2 -march=native -pthread -pg -Wall -Wextra
 PROF_LDFLAGS  := -pthread -pg
 
-.PHONY: all clean test bench bench-ci prof
+.PHONY: all clean test bench bench-ci prof discover discover-dry-run
 
 BENCH_START_INDEX ?= 14
 
@@ -68,4 +68,30 @@ bench-ci: $(BIN)
 	@LL_STOP_AFTER_ONE=0 ./$(BIN) $(BENCH_START_INDEX) 0
 
 clean:
-	rm -rf bin prof_report.txt gmon.out
+	rm -rf bin prof_report.txt gmon.out discover_out
+
+# discover: run full discover mode (set env vars to control behaviour).
+# Example: make discover LL_MAX_EXPONENT=136279950 LL_STOP_AFTER_N_CASES=1
+discover: $(BIN)
+	LL_SWEEP_MODE=discover \
+	LL_SINGLE_EXPONENT=$${LL_SINGLE_EXPONENT:-0} \
+	LL_MAX_EXPONENT=$${LL_MAX_EXPONENT:-200000000} \
+	LL_SHARD_COUNT=$${LL_SHARD_COUNT:-1} \
+	LL_SHARD_INDEX=$${LL_SHARD_INDEX:-0} \
+	LL_REVERSE_ORDER=$${LL_REVERSE_ORDER:-0} \
+	LL_STOP_AFTER_N_CASES=$${LL_STOP_AFTER_N_CASES:-0} \
+	LL_DRY_RUN=0 \
+	LL_OUTPUT_DIR=discover_out/ \
+	./$(BIN) 0 $${LL_THREADS:-0}
+
+# discover-dry-run: print the exponent plan without running LL tests.
+discover-dry-run: $(BIN)
+	LL_SWEEP_MODE=discover \
+	LL_SINGLE_EXPONENT=$${LL_SINGLE_EXPONENT:-0} \
+	LL_MAX_EXPONENT=$${LL_MAX_EXPONENT:-200000000} \
+	LL_SHARD_COUNT=$${LL_SHARD_COUNT:-1} \
+	LL_SHARD_INDEX=$${LL_SHARD_INDEX:-0} \
+	LL_REVERSE_ORDER=$${LL_REVERSE_ORDER:-0} \
+	LL_STOP_AFTER_N_CASES=$${LL_STOP_AFTER_N_CASES:-0} \
+	LL_DRY_RUN=1 \
+	./$(BIN) 0 1
