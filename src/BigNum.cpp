@@ -43,6 +43,7 @@
 #include <vector>
 #include <boost/multiprecision/cpp_int.hpp>
 #include <cerrno>
+#include <cinttypes>
 #include <ctime>
 #include <fstream>
 #include <sys/stat.h>
@@ -133,14 +134,19 @@ private:
 // ============================================================
 namespace mersenne {
 
-bool is_prime_exponent(uint32_t n) {
+bool is_prime_exponent(uint64_t n) {
     if (n < 2u) return false;
     if (n == 2u) return true;
     if ((n & 1u) == 0u) return false;
     if (n % 3u == 0u) return n == 3u;
     if (n % 5u == 0u) return n == 5u;
-    const uint64_t n64 = n;
-    for (uint32_t i = 7u; (uint64_t)i * i <= n64; i += 2u) {
+    // Require GCC/Clang __int128 to compute i*i without overflow.
+    // MSVC is not supported; the build system requires g++ or clang++.
+    // The __extension__ keyword suppresses -Wpedantic for this GCC/Clang extension.
+    __extension__ typedef unsigned __int128 u128_isprime;
+    static_assert(sizeof(u128_isprime) == 16,
+                  "is_prime_exponent requires 128-bit integer support (GCC/Clang)");
+    for (uint64_t i = 7u; (u128_isprime)i * i <= (u128_isprime)n; i += 2u) {
         if (n % i == 0u) return false;
     }
     return true;
@@ -174,23 +180,27 @@ inline std::vector<std::vector<uint32_t>> precharge_work_matrix(
 }
 
 // Returns true if p is in the known Mersenne prime exponent list.
-inline bool is_known_mersenne_prime(uint32_t p) {
+inline bool is_known_mersenne_prime(uint64_t p) {
     const auto& known = known_mersenne_prime_exponents();
-    return std::binary_search(known.begin(), known.end(), p);
+    // All known exponents fit in uint32_t; values above uint32 max are never known.
+    if (p > UINT32_MAX) return false;
+    const uint32_t p32 = static_cast<uint32_t>(p);
+    return std::binary_search(known.begin(), known.end(), p32);
 }
 
 // Generate all prime exponents p such that min_excl < p <= max_incl.
 // Returns results in ascending order.  Uses trial division via
 // is_prime_exponent(); iterates only odd candidates for efficiency.
-inline std::vector<uint32_t> generate_post_known_exponents(
-    uint32_t min_excl, uint32_t max_incl)
+// Bounds are uint64_t so searches above the uint32_t range are supported.
+inline std::vector<uint64_t> generate_post_known_exponents(
+    uint64_t min_excl, uint64_t max_incl)
 {
-    std::vector<uint32_t> result;
+    std::vector<uint64_t> result;
     if (max_incl <= min_excl) return result;
-    uint32_t start = min_excl + 1u;
+    uint64_t start = min_excl + 1u;
     // Skip even numbers > 2.
     if (start > 2u && (start & 1u) == 0u) ++start;
-    for (uint32_t p = start; p <= max_incl; p += (p == 2u ? 1u : 2u)) {
+    for (uint64_t p = start; p <= max_incl; p += (p == 2u ? 1u : 2u)) {
         if (is_prime_exponent(p)) result.push_back(p);
     }
     return result;
@@ -201,10 +211,11 @@ inline std::vector<uint32_t> generate_post_known_exponents(
 //   2. all prime p: min_excl < p <= max_incl (single_exp deduplicated),
 //   3. optionally reversed (range part only),
 //   4. optionally sharded (range part only; single_exp always included).
-inline std::vector<uint32_t> discover_exponent_list(
-    uint32_t single_exp,
-    uint32_t min_excl,
-    uint32_t max_incl,
+// All exponent values are uint64_t to support ranges above the uint32 limit.
+inline std::vector<uint64_t> discover_exponent_list(
+    uint64_t single_exp,
+    uint64_t min_excl,
+    uint64_t max_incl,
     bool     reverse_order = false,
     uint32_t shard_count   = 1u,
     uint32_t shard_index   = 0u)
@@ -213,7 +224,7 @@ inline std::vector<uint32_t> discover_exponent_list(
     if (shard_index >= shard_count) shard_index = 0u;
 
     // Generate exploration range.
-    std::vector<uint32_t> range = generate_post_known_exponents(min_excl, max_incl);
+    std::vector<uint64_t> range = generate_post_known_exponents(min_excl, max_incl);
 
     // Deduplicate: remove single_exp from range if it falls inside.
     if (single_exp != 0u) {
@@ -222,7 +233,7 @@ inline std::vector<uint32_t> discover_exponent_list(
 
     // Apply shard selection to the range part.
     if (shard_count > 1u) {
-        std::vector<uint32_t> shard;
+        std::vector<uint64_t> shard;
         shard.reserve(range.size() / shard_count + 1u);
         for (size_t i = 0; i < range.size(); ++i) {
             if (static_cast<uint32_t>(i % shard_count) == shard_index)
@@ -235,7 +246,7 @@ inline std::vector<uint32_t> discover_exponent_list(
     if (reverse_order) std::reverse(range.begin(), range.end());
 
     // Build result: explicit exponent first, then range.
-    std::vector<uint32_t> result;
+    std::vector<uint64_t> result;
     result.reserve((single_exp != 0u ? 1u : 0u) + range.size());
     if (single_exp != 0u && is_prime_exponent(single_exp))
         result.push_back(single_exp);
@@ -1112,7 +1123,7 @@ static const char* iso_timestamp_now(char buf[32]) {
 }
 
 struct DiscoverResult {
-    uint32_t    exponent{0};
+    uint64_t    exponent{0};
     bool        is_prime{false};
     bool        is_known{false};
     bool        is_new_discovery{false};
@@ -1125,7 +1136,7 @@ struct DiscoverResult {
 };
 
 // Return the backend name that lucas_lehmer() would select for exponent p.
-static std::string discover_backend_name(uint32_t p) {
+static std::string discover_backend_name(uint64_t p) {
     if (p < 128u) return "GenericBackend";
     const char* env = std::getenv("LL_LIMB_FFT_CROSSOVER");
     uint32_t crossover = 4000u;
@@ -1165,7 +1176,7 @@ static void write_discover_csv(
 static void write_discover_json(
     const std::string& path,
     const std::vector<DiscoverResult>& results,
-    uint32_t single_exp, uint32_t min_excl, uint32_t max_incl,
+    uint64_t single_exp, uint64_t min_excl, uint64_t max_incl,
     uint32_t shard_index, uint32_t shard_count,
     const std::string& run_url)
 {
@@ -1212,7 +1223,7 @@ static void write_discover_json(
 
 static void write_discovery_event_json(
     const std::string& path,
-    uint32_t exponent,
+    uint64_t exponent,
     double elapsed_sec,
     uint32_t shard_index,
     uint32_t shard_count,
@@ -1243,24 +1254,24 @@ static void write_discovery_event_json(
 }
 
 // Emit a loud, multi-channel discovery notification.
-static void emit_discovery_notification(uint32_t p, const std::string& run_url) {
+static void emit_discovery_notification(uint64_t p, const std::string& run_url) {
     // GitHub Actions workflow commands produce annotations in the UI.
-    std::printf("::notice title=NEW MERSENNE PRIME FOUND::M_%u is prime! "
-                "Exponent %u not in known list. Run: %s\n",
+    std::printf("::notice title=NEW MERSENNE PRIME FOUND::M_%" PRIu64 " is prime! "
+                "Exponent %" PRIu64 " not in known list. Run: %s\n",
                 p, p, run_url.c_str());
-    std::printf("::warning title=NEW MERSENNE PRIME FOUND::M_%u verified prime "
-                "by Lucas-Lehmer. Exponent %u unknown to the known list.\n",
+    std::printf("::warning title=NEW MERSENNE PRIME FOUND::M_%" PRIu64 " verified prime "
+                "by Lucas-Lehmer. Exponent %" PRIu64 " unknown to the known list.\n",
                 p, p);
 
-    // Prominent console banner.
+    // Prominent console banner (width-agnostic: no fixed-width field for exponent).
     std::printf("\n");
-    std::printf("*************************************************************\n");
-    std::printf("***                                                       ***\n");
-    std::printf("***   NEW MERSENNE PRIME CANDIDATE: M_%-18u   ***\n", p);
-    std::printf("***   Exponent %u NOT in known Mersenne list!        ***\n", p);
-    std::printf("***   VERIFY INDEPENDENTLY BEFORE ANNOUNCING!            ***\n");
-    std::printf("***                                                       ***\n");
-    std::printf("*************************************************************\n");
+    std::printf("***************************************************************\n");
+    std::printf("***                                                         ***\n");
+    std::printf("***   NEW MERSENNE PRIME CANDIDATE: M_%" PRIu64 "\n", p);
+    std::printf("***   Exponent %" PRIu64 " NOT in known Mersenne list!\n", p);
+    std::printf("***   VERIFY INDEPENDENTLY BEFORE ANNOUNCING!              ***\n");
+    std::printf("***                                                         ***\n");
+    std::printf("***************************************************************\n");
     std::printf("\n");
 
     // Append to GitHub Actions step summary if the env var is set.
@@ -1294,6 +1305,20 @@ static uint32_t env_uint32(const char* name, uint32_t def) {
     return static_cast<uint32_t>(v);
 }
 
+// Parse a 64-bit unsigned integer from an environment variable.
+// Returns def if the variable is unset/empty/invalid.
+static uint64_t env_uint64(const char* name, uint64_t def) {
+    const char* s = std::getenv(name);
+    if (!s || !*s) return def;
+    char* end = nullptr;
+    const unsigned long long v = std::strtoull(s, &end, 10);
+    if (end == s || *end != '\0') {
+        std::fprintf(stderr, "Invalid %s='%s'; using default %" PRIu64 "\n", name, s, def);
+        return def;
+    }
+    return static_cast<uint64_t>(v);
+}
+
 static bool env_bool(const char* name, bool def = false) {
     const char* s = std::getenv(name);
     if (!s || !*s) return def;
@@ -1306,12 +1331,12 @@ static int run_discover_mode(int argc, char** argv) {
     const unsigned maxCores = runtime::detect_available_cores();
 
     // --- Parse parameters (env vars, then argv override for threads) ---
-    const uint32_t single_exp   = env_uint32("LL_SINGLE_EXPONENT", 0u);
-    const uint32_t min_excl     = env_uint32("LL_MIN_EXPONENT",  136279841u);
-    const uint32_t max_incl     = env_uint32("LL_MAX_EXPONENT",  200000000u);
+    const uint64_t single_exp   = env_uint64("LL_SINGLE_EXPONENT", 0u);
+    const uint64_t min_excl     = env_uint64("LL_MIN_EXPONENT",  136279841u);
+    const uint64_t max_incl     = env_uint64("LL_MAX_EXPONENT",  200000000u);
     const uint32_t shard_count  = env_uint32("LL_SHARD_COUNT",   1u);
     const uint32_t shard_index  = env_uint32("LL_SHARD_INDEX",   0u);
-    const uint32_t stop_after_n = env_uint32("LL_STOP_AFTER_N_CASES", 0u);
+    const uint64_t stop_after_n = env_uint64("LL_STOP_AFTER_N_CASES", 0u);
     const bool reverse_order    = env_bool("LL_REVERSE_ORDER");
     const bool dry_run          = env_bool("LL_DRY_RUN");
     const bool progress         = env_bool("LL_PROGRESS");
@@ -1349,17 +1374,17 @@ static int run_discover_mode(int argc, char** argv) {
     }
 
     // --- Generate exponent list ---
-    const std::vector<uint32_t> exps = mersenne::discover_exponent_list(
+    const std::vector<uint64_t> exps = mersenne::discover_exponent_list(
         single_exp, min_excl, max_incl, reverse_order, shard_count, shard_index);
 
     // --- Print plan ---
     std::printf("=== DISCOVER MODE ===\n");
-    std::printf("  single_exponent  : %u\n", single_exp);
-    std::printf("  min_excl         : %u\n", min_excl);
-    std::printf("  max_incl         : %u\n", max_incl);
+    std::printf("  single_exponent  : %" PRIu64 "\n", single_exp);
+    std::printf("  min_excl         : %" PRIu64 "\n", min_excl);
+    std::printf("  max_incl         : %" PRIu64 "\n", max_incl);
     std::printf("  shard            : %u/%u\n", shard_index, shard_count);
     std::printf("  reverse_order    : %s\n", reverse_order ? "yes" : "no");
-    std::printf("  stop_after_n     : %u\n", stop_after_n);
+    std::printf("  stop_after_n     : %" PRIu64 "\n", stop_after_n);
     std::printf("  exponents_in_list: %zu\n", exps.size());
     std::printf("  threads          : %u / %u available\n", threads, maxCores);
     std::printf("  dry_run          : %s\n", dry_run ? "yes" : "no");
@@ -1371,7 +1396,7 @@ static int run_discover_mode(int argc, char** argv) {
         std::printf("DRY RUN: exponent plan (%zu items):\n", exps.size());
         for (size_t i = 0; i < exps.size(); ++i) {
             const bool first = (single_exp != 0u && i == 0u && exps[i] == single_exp);
-            std::printf("  [%zu] p=%-10u  backend=%-20s  %s\n",
+            std::printf("  [%zu] p=%-20" PRIu64 "  backend=%-20s  %s\n",
                         i, exps[i],
                         discover_backend_name(exps[i]).c_str(),
                         first ? "(explicit first)" : "");
@@ -1390,27 +1415,48 @@ static int run_discover_mode(int argc, char** argv) {
     results.reserve(exps.size());
 
     bool any_new_discovery = false;
-    uint32_t tested = 0u;
+    uint64_t tested = 0u;
 
     for (size_t i = 0; i < exps.size(); ++i) {
         if (stop_after_n != 0u && tested >= stop_after_n) {
-            std::printf("Stopping after %u cases (LL_STOP_AFTER_N_CASES).\n", stop_after_n);
+            std::printf("Stopping after %" PRIu64 " cases (LL_STOP_AFTER_N_CASES).\n", stop_after_n);
             break;
         }
-        const uint32_t p = exps[i];
+        const uint64_t p = exps[i];
         const bool is_first = (single_exp != 0u && i == 0u && p == single_exp);
 
-        std::printf("Testing M_%u ...%s\n", p, is_first ? " [explicit first exponent]" : "");
+        std::printf("Testing M_%" PRIu64 " ...%s\n", p, is_first ? " [explicit first exponent]" : "");
+
+        // Lucas-Lehmer currently requires p to fit in uint32_t.
+        // Exponents > UINT32_MAX cannot be tested by this implementation.
+        if (p > UINT32_MAX) {
+            std::printf("M_%" PRIu64 ": exponent exceeds uint32 range; skipping LL test.\n", p);
+            DiscoverResult r;
+            r.exponent         = p;
+            r.is_prime         = false;
+            r.is_known         = false;
+            r.is_new_discovery = false;
+            r.is_explicit_first = is_first;
+            r.elapsed_sec      = 0.0;
+            r.threads          = threads;
+            r.shard_index      = shard_index;
+            r.shard_count      = shard_count;
+            r.backend_name     = "skipped_exceeds_uint32";
+            results.push_back(r);
+            ++tested;
+            continue;
+        }
+        const uint32_t p32 = static_cast<uint32_t>(p);
 
         const auto t0     = std::chrono::steady_clock::now();
-        const bool isPrime = mersenne::lucas_lehmer(p, progress, /*benchmark_mode=*/false);
+        const bool isPrime = mersenne::lucas_lehmer(p32, progress, /*benchmark_mode=*/false);
         const auto t1     = std::chrono::steady_clock::now();
         const double elapsed = std::chrono::duration<double>(t1 - t0).count();
 
         const bool is_known = mersenne::is_known_mersenne_prime(p);
         const bool is_new   = isPrime && !is_known;
 
-        std::printf("M_%u is %s. Time: %.3f s%s\n",
+        std::printf("M_%" PRIu64 " is %s. Time: %.3f s%s\n",
                     p, isPrime ? "prime" : "composite", elapsed,
                     is_new ? "  *** NEW DISCOVERY ***" : "");
 
@@ -1505,7 +1551,7 @@ static int run_discover_mode(int argc, char** argv) {
         }
     }
 
-    std::printf("\nDiscover mode complete. Tested %u exponent(s).\n", tested);
+    std::printf("\nDiscover mode complete. Tested %" PRIu64 " exponent(s).\n", tested);
     if (any_new_discovery) {
         std::printf("NEW DISCOVERIES FOUND — see discovery_event.json and discover_results.json\n");
         return 3;  // distinct exit code for discovery
