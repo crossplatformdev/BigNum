@@ -20,6 +20,10 @@ name: Power-Range Prime Sweep (64 Buckets)
 
 on:
   workflow_call:
+    outputs:
+      new_discovery:
+        description: "Whether a new Mersenne prime was discovered"
+        value: ${{ jobs.merge.outputs.new_discovery }}
     inputs:
       bucket_start:
         description: "First bucket to run (1-64)"
@@ -167,6 +171,7 @@ jobs:
       batch_count:  ${{ steps.build-matrix.outputs.batch_count }}
     steps:
       - name: Validate confirm_run
+        if: github.event_name == 'workflow_dispatch'
         run: |
           if [[ "${{ inputs.confirm_run }}" != "yes" ]]; then
             echo "::error title=Confirmation required::Set confirm_run='yes' to run this workflow."
