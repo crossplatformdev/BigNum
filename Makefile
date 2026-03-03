@@ -32,7 +32,9 @@ $(PROF_BIN): $(SRC)
 
 test: $(TEST_BIN) $(BIN)
 	./$(TEST_BIN)
-	LL_STOP_AFTER_ONE=0 ./$(BIN) 0 0
+	# Run exponents[0..30] (M_2 … M_216091) with max threads.
+	# M_756839 (index 31) takes 20+ min on CI; LL_MAX_EXPONENT_INDEX=31 excludes it.
+	LL_STOP_AFTER_ONE=0 LL_MAX_EXPONENT_INDEX=31 ./$(BIN) 0 0
 
 # Profiling target: build with -pg, run a representative subset (index 14 = p=9689),
 # collect gmon.out, and generate a flat+call-graph report with gprof.
