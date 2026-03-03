@@ -1,4 +1,6 @@
+#include <algorithm>
 #include <cassert>
+#include <cstdint>
 #include <iostream>
 #include <vector>
 
@@ -11,10 +13,7 @@ static void test_precharge_distribution() {
     const unsigned threads = 3u;
     const size_t startIndex = 1u; // skip first element
 
-    std::vector<std::vector<uint32_t>> work_matrix(threads);
-    for (size_t idx = startIndex, slot = 0; idx < exponents.size(); ++idx, ++slot) {
-        work_matrix[slot % threads].push_back(exponents[idx]);
-    }
+    const auto work_matrix = mersenne::precharge_work_matrix(exponents, startIndex, threads);
 
     // Total items distributed must equal exponents.size() - startIndex
     size_t total = 0;

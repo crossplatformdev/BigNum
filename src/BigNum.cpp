@@ -98,6 +98,19 @@ const std::vector<uint32_t>& known_mersenne_prime_exponents() {
     return exponents;
 }
 
+// Distribute exponent values starting at startIndex across `threads` lanes
+// using round-robin, so each thread gets a pre-assigned slice of work.
+inline std::vector<std::vector<uint32_t>> precharge_work_matrix(
+    const std::vector<uint32_t>& exponents, size_t startIndex, unsigned threads)
+{
+    if (threads == 0u) threads = 1u;
+    std::vector<std::vector<uint32_t>> work_matrix(threads);
+    for (size_t idx = startIndex, slot = 0; idx < exponents.size(); ++idx, ++slot) {
+        work_matrix[slot % threads].push_back(exponents[idx]);
+    }
+    return work_matrix;
+}
+
 }  // namespace mersenne
 
 #ifndef BIGNUM_NO_MAIN
@@ -158,12 +171,9 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    // Precharge: distribute all exponent indices across threads upfront to
+    // Precharge: distribute all exponent values across threads upfront to
     // avoid per-iteration atomic fetch_add in the hot execution path.
-    std::vector<std::vector<uint32_t>> work_matrix(threads);
-    for (size_t idx = startIndex, slot = 0; idx < exponents.size(); ++idx, ++slot) {
-        work_matrix[slot % threads].push_back(exponents[idx]);
-    }
+    const auto work_matrix = mersenne::precharge_work_matrix(exponents, startIndex, threads);
 
     std::mutex printMutex;
     std::vector<std::thread> workers;
