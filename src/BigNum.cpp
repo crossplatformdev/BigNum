@@ -36,19 +36,24 @@ bool is_prime_exponent(uint32_t n) {
     if (n < 2u) return false;
     if (n == 2u) return true;
     if ((n & 1u) == 0u) return false;
-    if (n % 5u == 0u && n != 5u) return false;
-    for (uint32_t i = 3u; i <= (n / i); i += 2u) {
+    if (n % 3u == 0u) return n == 3u;
+    if (n % 5u == 0u) return n == 5u;
+    const uint64_t n64 = n;
+    for (uint32_t i = 7u; (uint64_t)i * i <= n64; i += 2u) {
         if (n % i == 0u) return false;
     }
     return true;
 }
 
-cpp_int mersenne_mod(cpp_int x, uint32_t p, const cpp_int& mask) {
-    while (x > mask) {
+static void mersenne_mod(cpp_int& x, uint32_t p, const cpp_int& mask) {
+    // After squaring, x < 2^(2p); at most two reduction steps are needed.
+    if (x > mask) {
         x = (x & mask) + (x >> p);
+        if (x > mask) {
+            x = (x & mask) + (x >> p);
+        }
     }
-    if (x == mask) return 0;
-    return x;
+    if (x == mask) x = 0;
 }
 
 bool lucas_lehmer(uint32_t p, bool progress) {
@@ -59,12 +64,19 @@ bool lucas_lehmer(uint32_t p, bool progress) {
 
     const cpp_int mask = (cpp_int(1) << p) - 1;
     cpp_int s = 4;
+    cpp_int sq;
     const uint32_t iters = p - 2u;
 
     const std::time_t start = std::time(nullptr);
+    uint32_t progress_countdown = 10000u;
     for (uint32_t i = 0; i < iters; ++i) {
-        s = mersenne_mod(s * s - 2, p, mask);
-        if (progress && ((i + 1u) % 10000u == 0u)) {
+        // Reuse sq's allocated storage across iterations to reduce allocator pressure.
+        sq = s * s;
+        sq -= 2;
+        mersenne_mod(sq, p, mask);
+        s = std::move(sq);
+        if (progress && --progress_countdown == 0u) {
+            progress_countdown = 10000u;
             const std::time_t now = std::time(nullptr);
             const double elapsed = std::difftime(now, start);
             const double avg = elapsed / static_cast<double>(i + 1u);
