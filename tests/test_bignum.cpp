@@ -339,6 +339,118 @@ int main() {
     test_discover_exponent_list_post_known_defaults();
     test_discovery_classification();
 
+    // --- power_bucket tests ---
+    // 1. bucket_range boundary generation
+    {
+        // n=1 normalized to [2, 2]
+        const auto r1 = power_bucket::bucket_range(1u);
+        assert(r1.lo == 2u && r1.hi == 2u);
+        // n=2: [2, 3]
+        const auto r2 = power_bucket::bucket_range(2u);
+        assert(r2.lo == 2u && r2.hi == 3u);
+        // n=3: [4, 7]
+        const auto r3 = power_bucket::bucket_range(3u);
+        assert(r3.lo == 4u && r3.hi == 7u);
+        // n=4: [8, 15]
+        const auto r4 = power_bucket::bucket_range(4u);
+        assert(r4.lo == 8u && r4.hi == 15u);
+        // n=64: [2^63, UINT64_MAX]
+        const auto r64 = power_bucket::bucket_range(64u);
+        assert(r64.lo == (UINT64_C(1) << 63) && r64.hi == UINT64_MAX);
+        // Invalid n=0 and n=65 return {0,0}
+        assert(power_bucket::bucket_range(0u).lo == 0u);
+        assert(power_bucket::bucket_range(65u).lo == 0u);
+    }
+
+    // 2. bucket normalization for n=1
+    {
+        const auto r = power_bucket::bucket_range(1u);
+        assert(r.lo == 2u && r.hi == 2u);
+        const auto v = power_bucket::enumerate_bucket_primes(1u);
+        assert(v.size() == 1u && v[0] == 2u);
+    }
+
+    // 3. no overlap between non-trivial adjacent buckets (n >= 3)
+    {
+        for (uint32_t n = 3u; n < 32u; ++n) {
+            const auto rn  = power_bucket::bucket_range(n);
+            const auto rn1 = power_bucket::bucket_range(n + 1u);
+            assert(rn.hi + 1u == rn1.lo);  // ranges are contiguous and non-overlapping
+        }
+    }
+
+    // 4. full coverage: union of all 64 buckets covers [2, UINT64_MAX]
+    {
+        // B_1=[2,2], B_2=[2,3], B_3=[4,7], ..., B_64=[2^63,UINT64_MAX]
+        // Verify B_2..B_64 partition [2, UINT64_MAX] with no gaps or overlaps.
+        uint64_t expected_lo = 2u;
+        for (uint32_t n = 2u; n <= 64u; ++n) {
+            const auto r = power_bucket::bucket_range(n);
+            assert(r.lo == expected_lo);
+            if (n < 64u)
+                expected_lo = r.hi + 1u;
+            else
+                assert(r.hi == UINT64_MAX);
+        }
+    }
+
+    // 5. prime exponent enumeration inside each bucket (small buckets only)
+    {
+        // Bucket 2: [2, 3] → primes 2, 3
+        const auto v2 = power_bucket::enumerate_bucket_primes(2u);
+        assert((v2 == std::vector<uint64_t>{2, 3}));
+
+        // Bucket 3: [4, 7] → primes 5, 7
+        const auto v3 = power_bucket::enumerate_bucket_primes(3u);
+        assert((v3 == std::vector<uint64_t>{5, 7}));
+
+        // Bucket 4: [8, 15] → primes 11, 13
+        const auto v4 = power_bucket::enumerate_bucket_primes(4u);
+        assert((v4 == std::vector<uint64_t>{11, 13}));
+
+        // All returned values must be prime
+        for (uint64_t p : v2) assert(mersenne::is_prime_exponent(p));
+        for (uint64_t p : v3) assert(mersenne::is_prime_exponent(p));
+        for (uint64_t p : v4) assert(mersenne::is_prime_exponent(p));
+
+        // Bucket 1 (normalized [2,2]): only prime is 2
+        const auto v1 = power_bucket::enumerate_bucket_primes(1u);
+        assert(v1.size() == 1u && v1[0] == 2u);
+    }
+
+    // 6. reverse ordering (verify via sorted comparison)
+    {
+        auto forward = power_bucket::enumerate_bucket_primes(5u);  // [16, 31]
+        auto reversed = forward;
+        std::reverse(reversed.begin(), reversed.end());
+        // All elements equal, just different order
+        auto fwd_sorted = forward;
+        auto rev_sorted = reversed;
+        std::sort(fwd_sorted.begin(), fwd_sorted.end());
+        std::sort(rev_sorted.begin(), rev_sorted.end());
+        assert(fwd_sorted == rev_sorted);
+        // forward is ascending, reversed is descending
+        for (size_t i = 1; i < forward.size(); ++i)
+            assert(forward[i] > forward[i - 1]);
+        for (size_t i = 1; i < reversed.size(); ++i)
+            assert(reversed[i] < reversed[i - 1]);
+    }
+
+    // 7. dry-run: bucket_range and enumerate_bucket_primes are deterministic
+    {
+        // Two calls with same n must return identical results.
+        const auto a = power_bucket::enumerate_bucket_primes(6u);
+        const auto b = power_bucket::enumerate_bucket_primes(6u);
+        assert(a == b);
+        assert(!a.empty());
+    }
+
+    // 8. invalid bucket returns empty prime list
+    {
+        assert(power_bucket::enumerate_bucket_primes(0u).empty());
+        assert(power_bucket::enumerate_bucket_primes(65u).empty());
+    }
+
     std::cout << "All tests passed\n";
     return 0;
 }
