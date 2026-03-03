@@ -1054,12 +1054,27 @@ int main(int argc, char** argv) {
         return s && *s != '\0' && std::strtoull(s, nullptr, 10) != 0ull;
     }();
 
+    // LL_MAX_EXPONENT_INDEX caps the exclusive upper bound of the exponent
+    // range to run.  Useful for CI to avoid timing out on very large exponents.
+    // Example: LL_MAX_EXPONENT_INDEX=31 limits the run to exponents[0..30].
+    const size_t maxExponentIndex = [] {
+        const char* s = std::getenv("LL_MAX_EXPONENT_INDEX");
+        if (s && *s != '\0') {
+            char* end = nullptr;
+            const unsigned long v = std::strtoul(s, &end, 10);
+            if (end != s && *end == '\0') return static_cast<size_t>(v);
+        }
+        return static_cast<size_t>(-1);  // no limit
+    }();
+
     const auto& exponents = mersenne::known_mersenne_prime_exponents();
     if (startIndex >= exponents.size()) {
         std::fprintf(stderr, "Invalid start index: %zu (max %zu)\n",
                      startIndex, exponents.size() - 1u);
         return 1;
     }
+
+    const size_t endIndex = std::min(exponents.size(), maxExponentIndex);
 
     std::printf("Using %u worker(s) out of %u available core(s).\n",
                 threads, maxCores);
@@ -1070,7 +1085,7 @@ int main(int argc, char** argv) {
     }
 
     if (threads == 1u) {
-        for (size_t idx = startIndex; idx < exponents.size(); ++idx)
+        for (size_t idx = startIndex; idx < endIndex; ++idx)
             test_exponent(exponents[idx], progress, benchmark_mode);
         return 0;
     }
@@ -1086,7 +1101,7 @@ int main(int argc, char** argv) {
             for (;;) {
                 const size_t idx =
                     next.fetch_add(1u, std::memory_order_relaxed);
-                if (idx >= exponents.size()) break;
+                if (idx >= endIndex) break;
                 const uint32_t p       = exponents[idx];
                 const auto     t0      = std::chrono::steady_clock::now();
                 const bool     isPrime =
