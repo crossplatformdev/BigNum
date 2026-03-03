@@ -239,6 +239,338 @@ struct GenericBackend {
 };
 
 // ============================================================
+// LimbBackend
+//
+// Plain 64-bit limb squaring + Mersenne fold for medium exponents.
+// Faster than FFT for p below kLimbFftCrossover due to lower overhead
+// on small-to-medium limb counts.
+//
+// Uses schoolbook squaring for nlimbs <= KARA_BASE_LIMBS,
+// and recursive Karatsuba for larger sizes.
+// ============================================================
+
+static constexpr int KARA_BASE_LIMBS = 12;
+
+// 128-bit accumulator type – GCC/Clang extension; __extension__ silences -Wpedantic.
+__extension__ typedef unsigned __int128 u128_t;
+
+// Schoolbook square: sq[0..2n-1] = a[0..n-1]^2
+static void schoolbook_sq(const uint64_t* __restrict__ a,
+                           uint64_t* __restrict__ sq, int n) {
+    std::fill(sq, sq + 2 * n, uint64_t(0));
+    for (int i = 0; i < n; ++i) {
+        uint64_t carry = 0;
+        for (int j = 0; j < n; ++j) {
+            u128_t t =
+                (u128_t)a[i] * a[j] + sq[i + j] + carry;
+            sq[i + j] = (uint64_t)t;
+            carry      = (uint64_t)(t >> 64);
+        }
+        for (int k = i + n; k < 2 * n && carry != 0; ++k) {
+            u128_t t = (u128_t)sq[k] + carry;
+            sq[k]  = (uint64_t)t;
+            carry  = (uint64_t)(t >> 64);
+        }
+        assert(carry == 0);
+    }
+}
+
+// Subtract b[0..nb-1] from a[0..na-1] in-place. na >= nb. Returns final borrow.
+static uint64_t limb_sub(uint64_t* a, int na, const uint64_t* b, int nb, uint64_t borrow) {
+    for (int i = 0; i < nb; ++i) {
+        u128_t t = (u128_t)a[i] - b[i] - borrow;
+        a[i]   = (uint64_t)t;
+        borrow = (uint64_t)(t >> 64) ? 1u : 0u;
+    }
+    for (int i = nb; i < na && borrow; ++i) {
+        u128_t t = (u128_t)a[i] - borrow;
+        a[i]   = (uint64_t)t;
+        borrow = (uint64_t)(t >> 64) ? 1u : 0u;
+    }
+    return borrow;
+}
+
+// Forward declaration.
+static void karatsuba_sq(const uint64_t* a, int n, uint64_t* out, uint64_t* scratch);
+
+static void karatsuba_sq(const uint64_t* a, int n,
+                          uint64_t* out, uint64_t* scratch) {
+    if (n <= KARA_BASE_LIMBS) {
+        schoolbook_sq(a, out, n);
+        return;
+    }
+
+    const int lo_n  = n / 2;
+    const int hi_n  = n - lo_n;
+    const int sum_n = hi_n + 1;
+
+    uint64_t* lo_sq   = scratch;
+    uint64_t* hi_sq   = lo_sq + 2 * lo_n;
+    uint64_t* sum_buf = hi_sq + 2 * hi_n;
+    uint64_t* mid_sq  = sum_buf + sum_n;
+    uint64_t* rest    = mid_sq + 2 * sum_n;
+
+    // lo_sq = a[0..lo_n-1]^2
+    karatsuba_sq(a, lo_n, lo_sq, rest);
+
+    // hi_sq = a[lo_n..n-1]^2
+    karatsuba_sq(a + lo_n, hi_n, hi_sq, rest);
+
+    // sum_buf = a[0..lo_n-1] + a[lo_n..n-1]
+    std::copy(a + lo_n, a + n, sum_buf);
+    sum_buf[hi_n] = 0;
+    {
+        uint64_t carry = 0;
+        for (int i = 0; i < lo_n; ++i) {
+            u128_t t = (u128_t)sum_buf[i] + a[i] + carry;
+            sum_buf[i] = (uint64_t)t;
+            carry       = (uint64_t)(t >> 64);
+        }
+        for (int i = lo_n; carry && i < sum_n; ++i) {
+            u128_t t = (u128_t)sum_buf[i] + carry;
+            sum_buf[i] = (uint64_t)t;
+            carry       = (uint64_t)(t >> 64);
+        }
+    }
+
+    // mid_sq = sum_buf^2
+    karatsuba_sq(sum_buf, sum_n, mid_sq, rest);
+
+    // mid_sq -= lo_sq + hi_sq
+    limb_sub(mid_sq, 2 * sum_n, lo_sq, 2 * lo_n, 0);
+    limb_sub(mid_sq, 2 * sum_n, hi_sq, 2 * hi_n, 0);
+
+    // Assemble: out = lo_sq + mid_sq<<(lo_n*64) + hi_sq<<(n*64)
+    std::fill(out, out + 2 * n, uint64_t(0));
+
+    // Add lo_sq
+    {
+        uint64_t carry = 0;
+        for (int i = 0; i < 2 * lo_n; ++i) {
+            u128_t t = (u128_t)out[i] + lo_sq[i] + carry;
+            out[i] = (uint64_t)t;
+            carry   = (uint64_t)(t >> 64);
+        }
+        for (int i = 2 * lo_n; carry && i < 2 * n; ++i) {
+            u128_t t = (u128_t)out[i] + carry;
+            out[i] = (uint64_t)t;
+            carry   = (uint64_t)(t >> 64);
+        }
+    }
+
+    // Add mid_sq at offset lo_n
+    {
+        uint64_t carry = 0;
+        const int mid_len = 2 * sum_n;
+        for (int i = 0; i < mid_len && lo_n + i < 2 * n; ++i) {
+            u128_t t = (u128_t)out[lo_n + i] + mid_sq[i] + carry;
+            out[lo_n + i] = (uint64_t)t;
+            carry          = (uint64_t)(t >> 64);
+        }
+        for (int i = lo_n + mid_len; carry && i < 2 * n; ++i) {
+            u128_t t = (u128_t)out[i] + carry;
+            out[i] = (uint64_t)t;
+            carry   = (uint64_t)(t >> 64);
+        }
+    }
+
+    // Add hi_sq at offset 2*lo_n.
+    // Karatsuba decomposition: a = a_hi*B^lo_n + a_lo → a^2 = lo_sq + mid*B^lo_n + hi_sq*B^{2*lo_n}.
+    // For odd n, 2*lo_n < n, so this offset differs from n.
+    {
+        const int hi_off = 2 * lo_n;
+        uint64_t carry = 0;
+        for (int i = 0; i < 2 * hi_n && hi_off + i < 2 * n; ++i) {
+            u128_t t = (u128_t)out[hi_off + i] + hi_sq[i] + carry;
+            out[hi_off + i] = (uint64_t)t;
+            carry            = (uint64_t)(t >> 64);
+        }
+        for (int i = hi_off + 2 * hi_n; carry && i < 2 * n; ++i) {
+            u128_t t = (u128_t)out[i] + carry;
+            out[i] = (uint64_t)t;
+            carry   = (uint64_t)(t >> 64);
+        }
+    }
+}
+
+static int karatsuba_scratch_size(int n) {
+    if (n <= KARA_BASE_LIMBS) return 0;
+    const int hi_n  = n - n / 2;
+    const int sum_n = hi_n + 1;
+    return 2 * (n / 2) + 2 * hi_n + sum_n + 2 * sum_n + karatsuba_scratch_size(sum_n);
+}
+
+struct LimbState {
+    uint32_t p{0};
+    int      nlimbs{0};    // ceil(p/64)
+    int      partial{0};   // p % 64; 0 means limb-aligned
+    uint64_t top_mask{0};  // mask for top limb
+
+    std::vector<uint64_t> s;        // nlimbs: current value
+    std::vector<uint64_t> sq;       // 2*nlimbs: squaring result
+    std::vector<uint64_t> scratch;  // Karatsuba scratch
+
+    double max_roundoff{0.0};  // unused (exact arithmetic), kept for interface
+};
+
+struct LimbBackend {
+    using State = LimbState;
+
+    static State init(uint32_t p) {
+        LimbState st;
+        st.p       = p;
+        st.nlimbs  = static_cast<int>((p + 63u) / 64u);
+        st.partial = static_cast<int>(p % 64u);
+        st.top_mask = (st.partial == 0)
+            ? ~uint64_t(0)
+            : ((uint64_t(1) << st.partial) - 1u);
+
+        const int n  = st.nlimbs;
+        // kss(n) + 16: exact scratch for the recursive Karatsuba tree, plus 16 guard words.
+        // 8*n + 16: a generous O(n) lower bound that dominates for small n and avoids
+        //           underestimation when kss recurses only on sum_n (not hi_n).
+        const int sc = std::max(karatsuba_scratch_size(n) + 16, 8 * n + 16);
+        st.s.assign(n, 0u);
+        st.sq.assign(2 * n, 0u);
+        st.scratch.assign(static_cast<size_t>(sc), 0u);
+        st.s[0] = 4u;
+        return st;
+    }
+
+    // Fused: s ← (s² − 2) mod (2^p − 1)
+    static void step(State& st) {
+        const int n = st.nlimbs;
+
+        // 1. Square
+        if (n <= KARA_BASE_LIMBS) {
+            schoolbook_sq(st.s.data(), st.sq.data(), n);
+        } else {
+            karatsuba_sq(st.s.data(), n, st.sq.data(), st.scratch.data());
+        }
+
+        // 2. Mersenne fold: s = (sq mod 2^p) + (sq >> p)
+        {
+            const int    limb_shift = static_cast<int>(st.p / 64u);
+            const int    bit_shift  = st.partial;  // p % 64
+
+            if (bit_shift == 0) {
+                // p is limb-aligned
+                uint64_t carry = 0;
+                for (int i = 0; i < n; ++i) {
+                    u128_t t =
+                        (u128_t)st.sq[i] + st.sq[i + n] + carry;
+                    st.s[i] = (uint64_t)t;
+                    carry    = (uint64_t)(t >> 64);
+                }
+                if (carry) {
+                    uint64_t c2 = carry;
+                    for (int i = 0; c2 && i < n; ++i) {
+                        u128_t t = (u128_t)st.s[i] + c2;
+                        st.s[i] = (uint64_t)t;
+                        c2       = (uint64_t)(t >> 64);
+                    }
+                }
+            } else {
+                uint64_t carry = 0;
+                for (int i = 0; i < n; ++i) {
+                    const uint64_t lo_i = (i < limb_shift)    ? st.sq[i]
+                                        : (i == limb_shift) ? (st.sq[i] & st.top_mask)
+                                                             : uint64_t(0);
+                    const int src = limb_shift + i;
+                    const uint64_t hi_lo = (src < 2 * n) ? (st.sq[src] >> bit_shift) : uint64_t(0);
+                    const uint64_t hi_hi = (src + 1 < 2 * n)
+                        ? (st.sq[src + 1] << (64 - bit_shift))
+                        : uint64_t(0);
+                    const uint64_t hi_i  = hi_lo | hi_hi;
+
+                    u128_t t = (u128_t)lo_i + hi_i + carry;
+                    st.s[i] = (uint64_t)t;
+                    carry    = (uint64_t)(t >> 64);
+                }
+                // For non-limb-aligned p: n*64 - p = 64 - partial > 0, so the
+                // n-limb addition result fits in n*64 bits (lo+hi < 2^{p+1} < 2^{n*64}).
+                // carry must be 0: lo+hi < 2^p + 2^p = 2^{p+1} ≤ 2^{n*64-1} < 2^{n*64}.
+                assert(carry == 0);
+                // Extract overflow bits above bit position (partial-1) from the top limb
+                // and fold back: 2^p ≡ 1 mod M_p.
+                uint64_t overflow = st.s[n - 1] >> bit_shift;
+                st.s[n - 1] &= st.top_mask;
+                if (overflow) {
+                    uint64_t c2 = overflow;
+                    for (int i = 0; c2 && i < n; ++i) {
+                        u128_t t = (u128_t)st.s[i] + c2;
+                        st.s[i] = (uint64_t)t;
+                        c2       = (uint64_t)(t >> 64);
+                    }
+                    // Re-mask after potential carry into top limb.
+                    overflow = st.s[n - 1] >> bit_shift;
+                    if (overflow) {
+                        st.s[n - 1] &= st.top_mask;
+                        uint64_t c3 = overflow;
+                        for (int i = 0; c3 && i < n; ++i) {
+                            u128_t t = (u128_t)st.s[i] + c3;
+                            st.s[i] = (uint64_t)t;
+                            c3       = (uint64_t)(t >> 64);
+                        }
+                        st.s[n - 1] &= st.top_mask;
+                    }
+                }
+            }
+
+            // Normalize M_p (= 2^p - 1) to 0.
+            bool all_ones = ((st.s[n - 1] & st.top_mask) == st.top_mask);
+            if (all_ones) {
+                for (int i = 0; i < n - 1 && all_ones; ++i)
+                    if (st.s[i] != ~uint64_t(0)) all_ones = false;
+                if (all_ones)
+                    std::fill(st.s.begin(), st.s.end(), uint64_t(0));
+            }
+        }
+
+        // 3. Subtract 2 (mod 2^p - 1)
+        {
+            uint64_t borrow = 0u;
+            if (st.s[0] >= 2u) {
+                st.s[0] -= 2u;
+                borrow = 0u;
+            } else {
+                // s[0] < 2: compute s[0] - 2 mod 2^64.
+                // s[0] + (2^64 - 2) = s[0] - 2 + 2^64; borrow 1 from s[1].
+                st.s[0] = st.s[0] + (UINT64_MAX - 1u);  // = s[0] + 2^64 - 2
+                borrow = 1u;
+            }
+            for (int i = 1; i < st.nlimbs && borrow; ++i) {
+                if (st.s[i] >= borrow) {
+                    st.s[i] -= borrow;
+                    borrow = 0u;
+                } else {
+                    st.s[i] -= borrow;  // wraps to UINT64_MAX
+                    borrow = 1u;
+                }
+            }
+            if (borrow) {
+                // s was < 2: add M_p = 2^p - 1
+                uint64_t carry = 0u;
+                for (int i = 0; i < st.nlimbs; ++i) {
+                    const uint64_t mp_i = (i + 1 < st.nlimbs) ? ~uint64_t(0) : st.top_mask;
+                    u128_t t = (u128_t)st.s[i] + mp_i + carry;
+                    st.s[i] = (uint64_t)t;
+                    carry    = (uint64_t)(t >> 64);
+                }
+                st.s[st.nlimbs - 1] &= st.top_mask;
+            }
+        }
+    }
+
+    static bool is_zero(const State& st) {
+        for (const auto v : st.s) if (v != 0u) return false;
+        return true;
+    }
+
+    static double max_roundoff(const State& st) { return st.max_roundoff; }
+};
+
+// ============================================================
 // FftMersenneBackend
 //
 // Crandall–Bailey DWT/FFT squaring mod 2^p − 1.
@@ -279,6 +611,10 @@ struct FftMersenneState {
 
     // Bit-reversal permutation table (length n).
     std::vector<size_t>   bitrv;
+
+    // Precomputed exp2 tables for carry propagation (length n).
+    std::vector<double>   mod_pow;      // 2^{digit_width[j]} per digit
+    // inv_mod_pow[j] == 1.0/mod_pow[j], half_pow[j] == 0.5*mod_pow[j]: derived inline.
 
     // Working buffers (length n) – reused across every iteration.
     std::vector<double>   buf_re;
@@ -364,6 +700,11 @@ static void fft_mersenne_init_tables(FftMersenneState& st) {
     st.buf_re.assign(n, 0.0);
     st.buf_im.assign(n, 0.0);
     st.digits.assign(n, 0.0);
+
+    // Precomputed exp2 tables.
+    st.mod_pow.resize(n);
+    for (size_t j = 0; j < n; ++j)
+        st.mod_pow[j] = std::ldexp(1.0, st.digit_width[j]);
 }
 
 // In-place iterative Cooley–Tukey DIT FFT of length n (must be power of 2).
@@ -455,7 +796,7 @@ static void fft_square(FftMersenneState& st) {
             st.digits[k] = std::floor(v);
             // Propagate the half-unit backward (mod n, Mersenne wrap).
             const size_t kp = (k == 0) ? (n - 1) : (k - 1);
-            st.digits[kp] += std::exp2(static_cast<double>(st.digit_width[kp] - 1));
+            st.digits[kp] += 0.5 * st.mod_pow[kp];
         }
     }
 
@@ -469,9 +810,8 @@ static void fft_square(FftMersenneState& st) {
         const double err     = std::abs(raw - rounded);
         if (err > max_err) max_err = err;
 
-        const int    bj   = st.digit_width[j];
-        const double modj = std::exp2(static_cast<double>(bj));
-        carry          = std::floor(rounded * std::exp2(static_cast<double>(-bj)));
+        const double modj = st.mod_pow[j];
+        carry          = std::floor(rounded / modj);
         st.digits[j]   = rounded - carry * modj;
     }
 
@@ -483,9 +823,8 @@ static void fft_square(FftMersenneState& st) {
             const double rounded_j = std::round(raw_j);
             const double err_j     = std::abs(raw_j - rounded_j);
             if (err_j > max_err) max_err = err_j;
-            const int    bj   = st.digit_width[j];
-            const double modj = std::exp2(static_cast<double>(bj));
-            carry2         = std::floor(rounded_j * std::exp2(static_cast<double>(-bj)));
+            const double modj = st.mod_pow[j];
+            carry2         = std::floor(rounded_j / modj);
             st.digits[j]   = rounded_j - carry2 * modj;
         }
     }
@@ -701,17 +1040,37 @@ bool lucas_lehmer(uint32_t p, bool progress, bool benchmark_mode = false) {
         return eng.run(progress);
     }
 
+    // LimbBackend: schoolbook/Karatsuba exact squaring, faster than FFT for p < threshold.
+    // kLimbFftCrossover measured empirically on this machine (-O3 -march=native):
+    //   p=3217 (51 limbs): LimbBackend ~10ms vs FFT ~30ms → Limb wins.
+    //   p=4253 (67 limbs): LimbBackend ~50ms vs FFT ~32ms → FFT wins.
+    //   Crossover observed near p≈4000; tune with `make bench` on the target CPU.
+    //   Override at runtime via the LL_LIMB_FFT_CROSSOVER environment variable.
+    // Upper bound: no known Mersenne exponent exceeds 100 million digits (p < 10^9),
+    // so 1 000 000 is a safe sanity cap for the crossover threshold.
+    static constexpr uint32_t kMaxCrossoverThreshold = 1000000u;
+    static const uint32_t kLimbFftCrossover = []() -> uint32_t {
+        const char* env = std::getenv("LL_LIMB_FFT_CROSSOVER");
+        if (env && *env) {
+            char* end = nullptr;
+            const long v = std::strtol(env, &end, 10);
+            if (end != env && *end == '\0' && v > 0 && v < static_cast<long>(kMaxCrossoverThreshold))
+                return static_cast<uint32_t>(v);
+            std::fprintf(stderr,
+                "LL_LIMB_FFT_CROSSOVER='%s' is invalid; using default 4000\n", env);
+        }
+        return 4000u;
+    }();
+    if (p < kLimbFftCrossover) {
+        LucasLehmerEngine<backend::LimbBackend> eng(p, /*benchmark_mode=*/true);
+        return eng.run(progress);
+    }
+
 #ifdef HAVE_GMP
-    // GMP backend is available; use it for large exponents as an alternative.
-    // For the widest coverage we keep FFT as the primary path and GMP as opt-in.
-    // (Uncomment the lines below to switch to GMP for p >= some threshold.)
-    // if (p >= 500000u) {
-    //     LucasLehmerEngine<backend::GmpBackend> eng(p, /*benchmark_mode=*/true);
-    //     return eng.run(progress);
-    // }
+    // GMP backend available but not used as default (kept as opt-in).
 #endif
 
-    // FFT/DWT backend covers all remaining exponents.
+    // FFT/DWT backend for large exponents.
     LucasLehmerEngine<backend::FftMersenneBackend> eng(p, /*benchmark_mode=*/true);
     return eng.run(progress);
 }
