@@ -168,6 +168,8 @@ static void test_discovery_classification() {
     // (136279879 is prime and > 136279841, so it's not in the known list.)
     assert(mersenne::is_prime_exponent(UINT64_C(136279879)));
     assert(!mersenne::is_known_mersenne_prime(136279879u));
+}
+
 // ---- sweep::generate_natural tests ----
 static void test_sweep_natural() {
     // Basic range
