@@ -251,6 +251,9 @@ struct GenericBackend {
 
 static constexpr int KARA_BASE_LIMBS = 12;
 
+// 128-bit accumulator type – GCC/Clang extension; __extension__ silences -Wpedantic.
+__extension__ typedef unsigned __int128 u128_t;
+
 // Schoolbook square: sq[0..2n-1] = a[0..n-1]^2
 static void schoolbook_sq(const uint64_t* __restrict__ a,
                            uint64_t* __restrict__ sq, int n) {
@@ -258,13 +261,13 @@ static void schoolbook_sq(const uint64_t* __restrict__ a,
     for (int i = 0; i < n; ++i) {
         uint64_t carry = 0;
         for (int j = 0; j < n; ++j) {
-            unsigned __int128 t =
-                (unsigned __int128)a[i] * a[j] + sq[i + j] + carry;
+            u128_t t =
+                (u128_t)a[i] * a[j] + sq[i + j] + carry;
             sq[i + j] = (uint64_t)t;
             carry      = (uint64_t)(t >> 64);
         }
         for (int k = i + n; carry != 0; ++k) {
-            unsigned __int128 t = (unsigned __int128)sq[k] + carry;
+            u128_t t = (u128_t)sq[k] + carry;
             sq[k]  = (uint64_t)t;
             carry  = (uint64_t)(t >> 64);
         }
@@ -274,12 +277,12 @@ static void schoolbook_sq(const uint64_t* __restrict__ a,
 // Subtract b[0..nb-1] from a[0..na-1] in-place. na >= nb. Returns final borrow.
 static uint64_t limb_sub(uint64_t* a, int na, const uint64_t* b, int nb, uint64_t borrow) {
     for (int i = 0; i < nb; ++i) {
-        unsigned __int128 t = (unsigned __int128)a[i] - b[i] - borrow;
+        u128_t t = (u128_t)a[i] - b[i] - borrow;
         a[i]   = (uint64_t)t;
         borrow = (uint64_t)(t >> 64) ? 1u : 0u;
     }
     for (int i = nb; i < na && borrow; ++i) {
-        unsigned __int128 t = (unsigned __int128)a[i] - borrow;
+        u128_t t = (u128_t)a[i] - borrow;
         a[i]   = (uint64_t)t;
         borrow = (uint64_t)(t >> 64) ? 1u : 0u;
     }
@@ -318,12 +321,12 @@ static void karatsuba_sq(const uint64_t* a, int n,
     {
         uint64_t carry = 0;
         for (int i = 0; i < lo_n; ++i) {
-            unsigned __int128 t = (unsigned __int128)sum_buf[i] + a[i] + carry;
+            u128_t t = (u128_t)sum_buf[i] + a[i] + carry;
             sum_buf[i] = (uint64_t)t;
             carry       = (uint64_t)(t >> 64);
         }
         for (int i = lo_n; carry && i < sum_n; ++i) {
-            unsigned __int128 t = (unsigned __int128)sum_buf[i] + carry;
+            u128_t t = (u128_t)sum_buf[i] + carry;
             sum_buf[i] = (uint64_t)t;
             carry       = (uint64_t)(t >> 64);
         }
@@ -343,12 +346,12 @@ static void karatsuba_sq(const uint64_t* a, int n,
     {
         uint64_t carry = 0;
         for (int i = 0; i < 2 * lo_n; ++i) {
-            unsigned __int128 t = (unsigned __int128)out[i] + lo_sq[i] + carry;
+            u128_t t = (u128_t)out[i] + lo_sq[i] + carry;
             out[i] = (uint64_t)t;
             carry   = (uint64_t)(t >> 64);
         }
         for (int i = 2 * lo_n; carry && i < 2 * n; ++i) {
-            unsigned __int128 t = (unsigned __int128)out[i] + carry;
+            u128_t t = (u128_t)out[i] + carry;
             out[i] = (uint64_t)t;
             carry   = (uint64_t)(t >> 64);
         }
@@ -359,12 +362,12 @@ static void karatsuba_sq(const uint64_t* a, int n,
         uint64_t carry = 0;
         const int mid_len = 2 * sum_n;
         for (int i = 0; i < mid_len && lo_n + i < 2 * n; ++i) {
-            unsigned __int128 t = (unsigned __int128)out[lo_n + i] + mid_sq[i] + carry;
+            u128_t t = (u128_t)out[lo_n + i] + mid_sq[i] + carry;
             out[lo_n + i] = (uint64_t)t;
             carry          = (uint64_t)(t >> 64);
         }
         for (int i = lo_n + mid_len; carry && i < 2 * n; ++i) {
-            unsigned __int128 t = (unsigned __int128)out[i] + carry;
+            u128_t t = (u128_t)out[i] + carry;
             out[i] = (uint64_t)t;
             carry   = (uint64_t)(t >> 64);
         }
@@ -377,12 +380,12 @@ static void karatsuba_sq(const uint64_t* a, int n,
         const int hi_off = 2 * lo_n;
         uint64_t carry = 0;
         for (int i = 0; i < 2 * hi_n && hi_off + i < 2 * n; ++i) {
-            unsigned __int128 t = (unsigned __int128)out[hi_off + i] + hi_sq[i] + carry;
+            u128_t t = (u128_t)out[hi_off + i] + hi_sq[i] + carry;
             out[hi_off + i] = (uint64_t)t;
             carry            = (uint64_t)(t >> 64);
         }
         for (int i = hi_off + 2 * hi_n; carry && i < 2 * n; ++i) {
-            unsigned __int128 t = (unsigned __int128)out[i] + carry;
+            u128_t t = (u128_t)out[i] + carry;
             out[i] = (uint64_t)t;
             carry   = (uint64_t)(t >> 64);
         }
@@ -453,15 +456,15 @@ struct LimbBackend {
                 // p is limb-aligned
                 uint64_t carry = 0;
                 for (int i = 0; i < n; ++i) {
-                    unsigned __int128 t =
-                        (unsigned __int128)st.sq[i] + st.sq[i + n] + carry;
+                    u128_t t =
+                        (u128_t)st.sq[i] + st.sq[i + n] + carry;
                     st.s[i] = (uint64_t)t;
                     carry    = (uint64_t)(t >> 64);
                 }
                 if (carry) {
                     uint64_t c2 = carry;
                     for (int i = 0; c2 && i < n; ++i) {
-                        unsigned __int128 t = (unsigned __int128)st.s[i] + c2;
+                        u128_t t = (u128_t)st.s[i] + c2;
                         st.s[i] = (uint64_t)t;
                         c2       = (uint64_t)(t >> 64);
                     }
@@ -479,7 +482,7 @@ struct LimbBackend {
                         : uint64_t(0);
                     const uint64_t hi_i  = hi_lo | hi_hi;
 
-                    unsigned __int128 t = (unsigned __int128)lo_i + hi_i + carry;
+                    u128_t t = (u128_t)lo_i + hi_i + carry;
                     st.s[i] = (uint64_t)t;
                     carry    = (uint64_t)(t >> 64);
                 }
@@ -493,7 +496,7 @@ struct LimbBackend {
                 if (overflow | carry) {
                     uint64_t c2 = overflow + carry;
                     for (int i = 0; c2 && i < n; ++i) {
-                        unsigned __int128 t = (unsigned __int128)st.s[i] + c2;
+                        u128_t t = (u128_t)st.s[i] + c2;
                         st.s[i] = (uint64_t)t;
                         c2       = (uint64_t)(t >> 64);
                     }
@@ -503,7 +506,7 @@ struct LimbBackend {
                         st.s[n - 1] &= st.top_mask;
                         uint64_t c3 = overflow;
                         for (int i = 0; c3 && i < n; ++i) {
-                            unsigned __int128 t = (unsigned __int128)st.s[i] + c3;
+                            u128_t t = (u128_t)st.s[i] + c3;
                             st.s[i] = (uint64_t)t;
                             c3       = (uint64_t)(t >> 64);
                         }
@@ -548,7 +551,7 @@ struct LimbBackend {
                 uint64_t carry = 0u;
                 for (int i = 0; i < st.nlimbs; ++i) {
                     const uint64_t mp_i = (i + 1 < st.nlimbs) ? ~uint64_t(0) : st.top_mask;
-                    unsigned __int128 t = (unsigned __int128)st.s[i] + mp_i + carry;
+                    u128_t t = (u128_t)st.s[i] + mp_i + carry;
                     st.s[i] = (uint64_t)t;
                     carry    = (uint64_t)(t >> 64);
                 }
