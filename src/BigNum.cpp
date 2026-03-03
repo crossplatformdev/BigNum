@@ -105,8 +105,10 @@ inline std::vector<std::vector<uint32_t>> precharge_work_matrix(
 {
     if (threads == 0u) threads = 1u;
     std::vector<std::vector<uint32_t>> work_matrix(threads);
-    for (size_t idx = startIndex, slot = 0; idx < exponents.size(); ++idx, ++slot) {
-        work_matrix[slot % threads].push_back(exponents[idx]);
+    unsigned slot = 0u;
+    for (size_t idx = startIndex; idx < exponents.size(); ++idx) {
+        work_matrix[slot].push_back(exponents[idx]);
+        if (++slot >= threads) slot = 0u;
     }
     return work_matrix;
 }
