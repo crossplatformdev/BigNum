@@ -1054,19 +1054,6 @@ int main(int argc, char** argv) {
         return s && *s != '\0' && std::strtoull(s, nullptr, 10) != 0ull;
     }();
 
-    // LL_MAX_EXPONENT_INDEX caps the exclusive upper bound of the exponent
-    // range to run.  Useful for CI to avoid timing out on very large exponents.
-    // Example: LL_MAX_EXPONENT_INDEX=31 limits the run to exponents[0..30].
-    const size_t maxExponentIndex = [] {
-        const char* s = std::getenv("LL_MAX_EXPONENT_INDEX");
-        if (s && *s != '\0') {
-            char* end = nullptr;
-            const unsigned long v = std::strtoul(s, &end, 10);
-            if (end != s && *end == '\0') return static_cast<size_t>(v);
-        }
-        return static_cast<size_t>(-1);  // no limit
-    }();
-
     const auto& exponents = mersenne::known_mersenne_prime_exponents();
     if (startIndex >= exponents.size()) {
         std::fprintf(stderr, "Invalid start index: %zu (max %zu)\n",
@@ -1074,7 +1061,40 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // LL_MAX_EXPONENT_INDEX caps the exclusive upper bound of the exponent
+    // range to run.  Useful for CI to avoid timing out on very large exponents.
+    // Example: LL_MAX_EXPONENT_INDEX=31 limits the run to exponents[0..30].
+    const size_t maxExponentIndex = [&exponents] {
+        const char* s = std::getenv("LL_MAX_EXPONENT_INDEX");
+        if (s && *s != '\0') {
+            char* end = nullptr;
+            const unsigned long v = std::strtoul(s, &end, 10);
+            // Require a pure non-negative integer string and a value within range.
+            if (end == s || *end != '\0' || v > exponents.size()) {
+                std::fprintf(stderr,
+                             "Ignoring invalid LL_MAX_EXPONENT_INDEX=\"%s\"; "
+                             "must be an integer in [0, %zu]. Using no limit.\n",
+                             s, exponents.size());
+                return exponents.size();  // no limit
+            }
+            return static_cast<size_t>(v);
+        }
+        // Environment variable not set or empty: no limit.
+        return exponents.size();
+    }();
+
     const size_t endIndex = std::min(exponents.size(), maxExponentIndex);
+
+    // If the effective range is empty (misconfigured index cap), bail out so
+    // the problem is visible rather than silently succeeding with zero work.
+    // LL_STOP_AFTER_ONE always runs exactly one exponent so it is exempt.
+    if (!stopAfterOne && startIndex >= endIndex) {
+        std::fprintf(stderr,
+                     "No exponents to test: startIndex=%zu >= endIndex=%zu. "
+                     "Check LL_MAX_EXPONENT_INDEX.\n",
+                     startIndex, endIndex);
+        return 1;
+    }
 
     std::printf("Using %u worker(s) out of %u available core(s).\n",
                 threads, maxCores);
