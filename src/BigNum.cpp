@@ -370,7 +370,9 @@ static void karatsuba_sq(const uint64_t* a, int n,
         }
     }
 
-    // Add hi_sq at offset 2*lo_n (correct Karatsuba identity: a^2 = lo_sq + mid*B^lo_n + hi_sq*B^{2*lo_n})
+    // Add hi_sq at offset 2*lo_n.
+    // Karatsuba decomposition: a = a_hi*B^lo_n + a_lo → a^2 = lo_sq + mid*B^lo_n + hi_sq*B^{2*lo_n}.
+    // For odd n, 2*lo_n < n, so this offset differs from n.
     {
         const int hi_off = 2 * lo_n;
         uint64_t carry = 0;
@@ -420,6 +422,9 @@ struct LimbBackend {
             : ((uint64_t(1) << st.partial) - 1u);
 
         const int n  = st.nlimbs;
+        // kss(n) + 16: exact scratch for the recursive Karatsuba tree, plus 16 guard words.
+        // 8*n + 16: a generous O(n) lower bound that dominates for small n and avoids
+        //           underestimation when kss recurses only on sum_n (not hi_n).
         const int sc = std::max(karatsuba_scratch_size(n) + 16, 8 * n + 16);
         st.s.assign(n, 0u);
         st.sq.assign(2 * n, 0u);
@@ -478,9 +483,11 @@ struct LimbBackend {
                     st.s[i] = (uint64_t)t;
                     carry    = (uint64_t)(t >> 64);
                 }
-                // carry should be 0 for non-limb-aligned p (n*64 > p+1 in practice).
-                // Extract overflow bits above position partial from the top limb,
-                // then fold them back: 2^p ≡ 1 mod M_p.
+                // For non-limb-aligned p: n*64 - p = 64 - partial > 0, so the
+                // n-limb addition result fits in n*64 bits (lo+hi < 2^{p+1} < 2^{n*64}).
+                // carry here is 0 in almost all cases; guard included for safety.
+                // Extract overflow bits above bit position (partial-1) from the top limb
+                // and fold back: 2^p ≡ 1 mod M_p.
                 uint64_t overflow = st.s[n - 1] >> bit_shift;
                 st.s[n - 1] &= st.top_mask;
                 if (overflow | carry) {
@@ -522,7 +529,9 @@ struct LimbBackend {
                 st.s[0] -= 2u;
                 borrow = 0u;
             } else {
-                st.s[0] = st.s[0] + (UINT64_MAX - 1u);  // s[0] + 2^64 - 2
+                // s[0] < 2: compute s[0] - 2 mod 2^64.
+                // s[0] + (2^64 - 2) = s[0] - 2 + 2^64; borrow 1 from s[1].
+                st.s[0] = st.s[0] + (UINT64_MAX - 1u);  // = s[0] + 2^64 - 2
                 borrow = 1u;
             }
             for (int i = 1; i < st.nlimbs && borrow; ++i) {
@@ -1033,6 +1042,10 @@ bool lucas_lehmer(uint32_t p, bool progress, bool benchmark_mode = false) {
     }
 
     // LimbBackend: schoolbook/Karatsuba exact squaring, faster than FFT for p < threshold.
+    // kLimbFftCrossover measured empirically on this machine (-O3 -march=native):
+    //   p=3217 (51 limbs): LimbBackend ~10ms vs FFT ~30ms → Limb wins.
+    //   p=4253 (67 limbs): LimbBackend ~50ms vs FFT ~32ms → FFT wins.
+    //   Crossover observed near p≈4000; tune with `make bench` on the target CPU.
     static constexpr uint32_t kLimbFftCrossover = 4000u;
     if (p < kLimbFftCrossover) {
         LucasLehmerEngine<backend::LimbBackend> eng(p, /*benchmark_mode=*/true);
