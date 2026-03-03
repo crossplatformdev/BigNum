@@ -791,29 +791,16 @@ int main(int argc, char** argv) {
                 const size_t idx =
                     next.fetch_add(1u, std::memory_order_relaxed);
                 if (idx >= exponents.size()) break;
-                const uint32_t p  = exponents[idx];
-                const auto     t0 = std::chrono::steady_clock::now();
-                const bool isPrime =
+                const uint32_t p       = exponents[idx];
+                const auto     t0      = std::chrono::steady_clock::now();
+                const bool     isPrime =
                     mersenne::lucas_lehmer(p, progress, benchmark_mode);
-    // Precharge: distribute all exponent values across threads upfront to
-    // avoid per-iteration atomic fetch_add in the hot execution path.
-    const auto work_matrix = mersenne::precharge_work_matrix(exponents, startIndex, threads);
-
-    std::mutex printMutex;
-    std::vector<std::thread> workers;
-    workers.reserve(threads);
-
-    for (unsigned t = 0; t < threads; ++t) {
-        workers.emplace_back([&, t]() {
-            for (const uint32_t p : work_matrix[t]) {
-                const auto t0 = std::chrono::steady_clock::now();
-                const bool isPrime = mersenne::lucas_lehmer(p, true);
                 const auto t1 = std::chrono::steady_clock::now();
-                const std::chrono::duration<double> el = t1 - t0;
+                const std::chrono::duration<double> elapsed = t1 - t0;
                 std::lock_guard<std::mutex> lk(printMu);
                 std::printf("Testing M_%u ...\n", p);
                 std::printf("M_%u is %s. Time: %.3f s\n",
-                            p, isPrime ? "prime" : "composite", el.count());
+                            p, isPrime ? "prime" : "composite", elapsed.count());
             }
         });
     }
