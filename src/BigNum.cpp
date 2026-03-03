@@ -31,6 +31,7 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
@@ -311,8 +312,9 @@ static void fft_mersenne_init_tables(FftMersenneState& st) {
     const size_t half = n >> 1;
     st.tw_re.resize(half);
     st.tw_im.resize(half);
+    const double pi = std::acos(-1.0);
     for (size_t m = 0; m < half; ++m) {
-        const double angle = -2.0 * M_PI * m / static_cast<double>(n);
+        const double angle = -2.0 * pi * m / static_cast<double>(n);
         st.tw_re[m] = std::cos(angle);
         st.tw_im[m] = std::sin(angle);
     }
@@ -325,7 +327,7 @@ static void fft_mersenne_init_tables(FftMersenneState& st) {
     st.w_inv.resize(n);
 
     for (size_t j = 0; j < n; ++j) {
-        // bit position B_j = ⌊j·p/n⌋  (no overflow: j < n ≤ 2^25, p < 2^28)
+        // bit position B_j = ⌊j·p/n⌋  (no overflow: j < n ≤ 2^30, p < 2^32, computed in uint64_t)
         const uint64_t jp = static_cast<uint64_t>(j) * p;
         const uint64_t Bj = jp / n;
         const uint64_t rem = jp % n;               // n · frac(j·p/n)
@@ -456,16 +458,17 @@ static void fft_square(FftMersenneState& st) {
 
     // Wrap-around: carry * 2^p ≡ carry (mod M_p); add to digit 0 and re-normalize.
     if (carry != 0.0) {
-        const double raw     = st.digits[0] + carry;
-        const double rounded = std::round(raw);
-        const double err     = std::abs(raw - rounded);
-        if (err > max_err) max_err = err;
-
-        const int    b0   = st.digit_width[0];
-        const double mod0 = std::exp2(static_cast<double>(b0));
-        const double c    = std::floor(rounded * std::exp2(static_cast<double>(-b0)));
-        st.digits[0]      = rounded - c * mod0;
-        if (c != 0.0) st.digits[1] += c;
+        double carry2 = carry;
+        for (size_t j = 0; j < n && carry2 != 0.0; ++j) {
+            const double raw_j     = st.digits[j] + carry2;
+            const double rounded_j = std::round(raw_j);
+            const double err_j     = std::abs(raw_j - rounded_j);
+            if (err_j > max_err) max_err = err_j;
+            const int    bj   = st.digit_width[j];
+            const double modj = std::exp2(static_cast<double>(bj));
+            carry2         = std::floor(rounded_j * std::exp2(static_cast<double>(-bj)));
+            st.digits[j]   = rounded_j - carry2 * modj;
+        }
     }
 
     if (max_err > st.max_roundoff) st.max_roundoff = max_err;
@@ -549,13 +552,16 @@ struct GmpBackend {
         } else {
             // Extract hi starting at bit p:
             //   hi = sq >> p  (n limbs worth)
-            std::vector<mp_limb_t> hi(n, 0);
-            mpn_rshift(hi.data(), st.sq.data() + (st.p / GMP_NUMB_BITS),
-                       static_cast<mp_size_t>(2 * n - st.p / GMP_NUMB_BITS),
+            const size_t limb_offset = st.p / GMP_NUMB_BITS;
+            const size_t shift_limbs = 2 * n - limb_offset;
+            std::vector<mp_limb_t> hi(shift_limbs, 0);
+            mpn_rshift(hi.data(), st.sq.data() + limb_offset,
+                       static_cast<mp_size_t>(shift_limbs),
                        partial);
             // lo = sq[0..n-1] masked to p bits
             std::vector<mp_limb_t> lo(st.sq.begin(), st.sq.begin() + static_cast<ptrdiff_t>(n));
             lo[n - 1] &= (mp_limb_t(1) << partial) - 1;  // clear bits above p
+            // Only the first n limbs of hi are used; higher limbs are 0 since sq < 2^(2p)
             carry = mpn_add_n(st.s.data(), lo.data(), hi.data(),
                               static_cast<mp_size_t>(n));
         }
@@ -565,15 +571,20 @@ struct GmpBackend {
             carry = mpn_add_1(st.s.data(), st.s.data(), static_cast<mp_size_t>(n), 1);
         }
 
-        // Subtract 2.
-        mpn_sub_1(st.s.data(), st.s.data(), static_cast<mp_size_t>(n), 2);
+        // Subtract 2 (mod 2^p − 1). Capture borrow to perform wrap-around if needed.
+        mp_limb_t borrow = mpn_sub_1(st.s.data(), st.s.data(), static_cast<mp_size_t>(n), 2);
 
-        // Reduce top limb mask.
+        if (borrow) {
+            // Underflow: add back the modulus M = 2^p − 1 (all ones in p bits).
+            std::vector<mp_limb_t> mod(n, ~mp_limb_t(0));
+            if (partial != 0)
+                mod[n - 1] = (mp_limb_t(1) << partial) - 1;
+            (void)mpn_add_n(st.s.data(), st.s.data(), mod.data(), static_cast<mp_size_t>(n));
+        }
+
+        // Reduce top limb mask to ensure s stays within p bits.
         if (partial != 0)
             st.s[n - 1] &= (mp_limb_t(1) << partial) - 1;
-
-        // Handle potential borrow (should not happen for correct LL, but be safe).
-        // (If borrow occurred, s wrapped; just let it be – it won't happen for known primes.)
     }
 
     static bool is_zero(const State& st) {
