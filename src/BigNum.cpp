@@ -1,5 +1,4 @@
 #include <algorithm>
-#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -159,17 +158,20 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    std::atomic<size_t> next{startIndex};
+    // Precharge: distribute all exponent indices across threads upfront to
+    // avoid per-iteration atomic fetch_add in the hot execution path.
+    std::vector<std::vector<uint32_t>> work_matrix(threads);
+    for (size_t idx = startIndex, slot = 0; idx < exponents.size(); ++idx, ++slot) {
+        work_matrix[slot % threads].push_back(exponents[idx]);
+    }
+
     std::mutex printMutex;
     std::vector<std::thread> workers;
     workers.reserve(threads);
 
     for (unsigned t = 0; t < threads; ++t) {
-        workers.emplace_back([&]() {
-            for (;;) {
-                const size_t idx = next.fetch_add(1u, std::memory_order_relaxed);
-                if (idx >= exponents.size()) break;
-                const uint32_t p = exponents[idx];
+        workers.emplace_back([&, t]() {
+            for (const uint32_t p : work_matrix[t]) {
                 const auto t0 = std::chrono::steady_clock::now();
                 const bool isPrime = mersenne::lucas_lehmer(p, true);
                 const auto t1 = std::chrono::steady_clock::now();
