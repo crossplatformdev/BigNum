@@ -224,20 +224,20 @@ struct GenericBackend {
 // Crandall–Bailey DWT/FFT squaring mod 2^p − 1.
 //
 // Representation: x = Σ_{j=0}^{n-1} d_j · 2^{B_j}
-//   where B_j = ⌊j·p/n⌋,  d_j ∈ [−2^{b_j−1}, 2^{b_j−1}]  (balanced),
-//   b_j = B_{j+1} − B_j ∈ {b_lo, b_hi}.
+//   where B_j = ⌊j·p/n⌋,  b_j = B_{j+1} − B_j ∈ {b_lo, b_hi}.
 //
-// Forward DWT:  y_j = w_j · d_j,  then length-n complex DFT → Y.
-// Squaring:     Z_k = Y_k².
-// Inverse DWT:  z_j = IDFT(Z)_j / (n · w_j), round, carry-propagate.
+// Irrational-base coefficient: ã_j = d_j / w_j  where w_j = 2^{frac(j·p/n)}.
+// This maps to the ring Z[β]/(β^n − 1), β = 2^{p/n}, where squaring
+// is exactly the cyclic convolution (since β^n = 2^p ≡ 1 mod M_p).
 //
-// The DWT weights w_j = 2^{frac(j·p/n)} absorb the "irrational base",
-// turning the cyclic convolution into exact squaring mod 2^p − 1.
+// Algorithm per iteration:
+//   Forward DWT:  ỹ_j = d_j / w_j  (divide by weight)
+//   Forward FFT:  Y = FFT(ỹ)
+//   Pointwise:    Z_k = Y_k²
+//   Inverse FFT:  z = IFFT(Z)  (unnormalized, includes factor n)
+//   Inverse DWT:  d'_j = z_j · (w_j / n),  round, carry-propagate
 //
-// Precision selection: choose smallest n = 2^k such that the worst-case
-// FFT rounding error < 0.45:
-//   5 · k · n · (2^{b_hi})^2 · 2^{−53} < 0.45
-// which guarantees every rounded digit is correct.
+// Precision bound: 5 · log2(n) · n · (2^b_hi)² · 2^{−53} < 0.45
 // ============================================================
 
 struct FftMersenneState {
@@ -249,8 +249,9 @@ struct FftMersenneState {
     // Per-digit info (length n), precomputed once.
     std::vector<int>      digit_width;  // b_j for each digit
     std::vector<uint64_t> bit_pos;      // B_j = ⌊j·p/n⌋
-    std::vector<double>   w_fwd;        // forward DWT weight: 2^{frac(j·p/n)}
-    std::vector<double>   w_inv;        // inverse DWT weight: 1/(n · w_fwd[j])
+    std::vector<double>   w_fwd;        // DWT weight: 2^{frac(j·p/n)}
+    std::vector<double>   w_fwd_inv;    // forward DWT divisor: 1/w_fwd[j]
+    std::vector<double>   w_inv;        // inverse DWT scale:   w_fwd[j] / n
 
     // FFT twiddle table, length n/2:  twiddle[k] = e^{−2πik/n}.
     std::vector<double>   tw_re;        // cos(−2πk/n)
@@ -263,7 +264,7 @@ struct FftMersenneState {
     std::vector<double>   buf_re;
     std::vector<double>   buf_im;
 
-    // Current state: balanced digits d_j.
+    // Current state: digit representation d_j.
     std::vector<double>   digits;
 
     // Diagnostic.
@@ -320,6 +321,7 @@ static void fft_mersenne_init_tables(FftMersenneState& st) {
     st.digit_width.resize(n);
     st.bit_pos.resize(n);
     st.w_fwd.resize(n);
+    st.w_fwd_inv.resize(n);
     st.w_inv.resize(n);
 
     for (size_t j = 0; j < n; ++j) {
@@ -332,8 +334,9 @@ static void fft_mersenne_init_tables(FftMersenneState& st) {
         const uint64_t jp1 = static_cast<uint64_t>(j + 1) * p;
         st.digit_width[j] = static_cast<int>(jp1 / n - Bj);
         // w_fwd[j] = 2^{frac(j·p/n)} = 2^{rem/n}
-        st.w_fwd[j] = std::exp2(static_cast<double>(rem) / static_cast<double>(n));
-        st.w_inv[j] = 1.0 / (static_cast<double>(n) * st.w_fwd[j]);
+        st.w_fwd[j]     = std::exp2(static_cast<double>(rem) / static_cast<double>(n));
+        st.w_fwd_inv[j] = 1.0 / st.w_fwd[j];            // for forward DWT (divide)
+        st.w_inv[j]     = st.w_fwd[j] / static_cast<double>(n);  // for inverse DWT (multiply)
     }
 
     // Working buffers.
@@ -386,9 +389,9 @@ static void fft_square(FftMersenneState& st) {
     double* re = st.buf_re.data();
     double* im = st.buf_im.data();
 
-    // Forward DWT: load weighted digits into re[]; im[] = 0.
+    // Forward DWT: ỹ_j = d_j / w_j  (multiply by 1/w_fwd[j]).
     for (size_t j = 0; j < n; ++j) {
-        re[j] = st.w_fwd[j] * st.digits[j];
+        re[j] = st.w_fwd_inv[j] * st.digits[j];
         im[j] = 0.0;
     }
 
@@ -402,45 +405,66 @@ static void fft_square(FftMersenneState& st) {
         im[k] = 2.0 * r * i;
     }
 
-    // Inverse FFT (no 1/n yet).
+    // Inverse FFT (unnormalized – no 1/n; that factor is absorbed into w_inv).
     fft_core(re, im, st.bitrv.data(), st.tw_re.data(), st.tw_im.data(), n, -1);
 
-    // Inverse DWT: divide by n·w_fwd, round, carry-propagate.
-    // First pass: compute unrounded digit values.
+    // Inverse DWT: d'_j = z_j · (w_fwd[j] / n).
     for (size_t j = 0; j < n; ++j)
-        st.digits[j] = re[j] * st.w_inv[j];   // = re[j] / (n · w_fwd[j])
+        st.digits[j] = re[j] * st.w_inv[j];
 
-    // Carry propagation with balanced-digit normalization.
-    // Each digit d_j has modulus M_j = 2^{b_j}; we keep d_j ∈ [−M_j/2, M_j/2).
+    // Half-integer correction (Mersenne-specific).
+    //
+    // Background: for diagonal squaring pair (j,j) where carry(j,j)=1
+    // (i.e. frac(j·p/n) ≥ 0.5) and d_j is odd, the inverse DWT places
+    // the value d_j²/2 at position k = (2j) mod n, giving a half-integer
+    // pre-carry digit.
+    //
+    // Interpretation: 0.5 at bit-position B_k represents 2^{B_k−1}.
+    // Since B_k−1 = B_{k−1} + b_{k−1} − 1, adding 2^{b_{k−1}−1} to
+    // digit (k−1) mod n (with Mersenne wrap-around for k=0) gives the
+    // correct integer representation and avoids rounding ambiguity.
+    //
+    // Detection: |frac(d'_k) − 0.5| < 0.25  (FFT error is < 0.45 away
+    // from the true value, so a genuine half-integer is never ambiguous).
+    for (size_t k = 0; k < n; ++k) {
+        const double v    = st.digits[k];
+        const double frac = v - std::floor(v);
+        if (std::abs(frac - 0.5) < 0.25) {
+            // Remove the 0.5 from digit k.
+            st.digits[k] = std::floor(v);
+            // Propagate the half-unit backward (mod n, Mersenne wrap).
+            const size_t kp = (k == 0) ? (n - 1) : (k - 1);
+            st.digits[kp] += std::exp2(static_cast<double>(st.digit_width[kp] - 1));
+        }
+    }
+
+    // Carry propagation: reduce each digit to [0, 2^{b_j}).
+    // Carries propagate upward; the final carry wraps around (2^p ≡ 1 mod M_p).
     double carry = 0.0;
     double max_err = 0.0;
     for (size_t j = 0; j < n; ++j) {
-        const double raw = st.digits[j] + carry;
+        const double raw     = st.digits[j] + carry;
         const double rounded = std::round(raw);
-        const double err = std::abs(raw - rounded);
+        const double err     = std::abs(raw - rounded);
         if (err > max_err) max_err = err;
 
         const int    bj   = st.digit_width[j];
         const double modj = std::exp2(static_cast<double>(bj));
-        // carry = ⌊rounded / M_j⌋  (arithmetic, signed)
-        carry = std::floor(rounded / modj + 0.5);  // round to signed integer carry
-        // Actually use truncating division towards −∞:
-        carry = std::floor(rounded * std::exp2(-static_cast<double>(bj)));
-        st.digits[j] = rounded - carry * modj;
+        carry          = std::floor(rounded * std::exp2(static_cast<double>(-bj)));
+        st.digits[j]   = rounded - carry * modj;
     }
-    // Wrap-around carry: adding carry ≡ carry (mod 2^p − 1) to digit 0.
-    st.digits[0] += carry;
 
-    // One extra normalization pass for digit 0 (in case carry pushed it out).
-    {
-        const double raw     = st.digits[0];
+    // Wrap-around: carry * 2^p ≡ carry (mod M_p); add to digit 0 and re-normalize.
+    if (carry != 0.0) {
+        const double raw     = st.digits[0] + carry;
         const double rounded = std::round(raw);
         const double err     = std::abs(raw - rounded);
         if (err > max_err) max_err = err;
+
         const int    b0   = st.digit_width[0];
         const double mod0 = std::exp2(static_cast<double>(b0));
-        double c = std::floor(rounded * std::exp2(-static_cast<double>(b0)));
-        st.digits[0] = rounded - c * mod0;
+        const double c    = std::floor(rounded * std::exp2(static_cast<double>(-b0)));
+        st.digits[0]      = rounded - c * mod0;
         if (c != 0.0) st.digits[1] += c;
     }
 
