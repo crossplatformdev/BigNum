@@ -4,10 +4,10 @@
 Redesign the C++ Lucas-Lehmer benchmark for Mersenne numbers for real throughput gains on large exponents. Do not do cosmetic cleanup. Preserve correctness while replacing the current generic big-integer hot path with a production-grade, benchmarked, profiled implementation.
 
 ## Current context
-- The current code uses `boost::multiprecision::cpp_int`.
+- `boost::multiprecision::cpp_int` is the fallback/reference backend (used for small exponents and correctness validation); the hot path is already `FftMersenneBackend` for large exponents and optionally `GmpBackend` for medium sizes.
 - Each Lucas-Lehmer iteration is effectively: `s = (s * s - 2) mod (2^p - 1)`.
 - The exponent list is a benchmark list of already-known Mersenne-prime exponents, so benchmark mode is not a search engine.
-- Current bottlenecks are generic big-int squaring, allocation/storage overhead, and avoidable work inside the hot loop.
+- Current bottlenecks are FFT squaring efficiency, allocation/storage overhead, and avoidable work inside the hot loop.
 - Running different exponents on different threads is not the optimal model for a single very large exponent.
 
 ## Non-negotiable rules
@@ -70,7 +70,7 @@ For non-FFT backends, consider tuned carry chains and BMI2/ADX paths such as `MU
 
 ## Lucas-Lehmer loop requirements
 Fuse each iteration into a single hot operation:
-- `s = square_sub2_mod_mersenne(s, p)`
+- implemented as a single backend call (e.g. `backend.step(state)`) that performs `s = (s * s - 2) mod (2^p - 1)`
 
 Also:
 - avoid recomputing masks and temporaries
@@ -79,7 +79,7 @@ Also:
 - make progress output optional and sparse
 - replace `std::time` / `difftime` with `steady_clock`
 - add checkpointing every N iterations with residue, elapsed time, max roundoff seen, and resumability
-- fix the current bug where worker threads force `lucas_lehmer(p, true)` instead of honoring the `progress` flag
+- ensure worker threads honor the caller's `progress` flag when invoking `lucas_lehmer(p, progress)`; avoid regressing to forcing `progress = true`
 - skip `is_prime_exponent()` in benchmark mode when using the known-prime exponent list
 
 ## Parallelism requirements
@@ -211,8 +211,8 @@ Implement in phases:
 8. finalize validation and publish before/after benchmark and profiler reports
 
 ## Code-specific notes that must be preserved
-- The exponent list is already a list of known Mersenne-prime exponents, so `is_prime_exponent()` is benchmark overhead in benchmark mode.
-- The current worker path forces `progress=true`, which hurts performance and creates noise.
+- The exponent list is already a list of known Mersenne-prime exponents, so benchmark mode must continue to skip `is_prime_exponent()` checks.
+- Worker threads must continue to honor the caller's `progress` flag; do not regress to forcing `progress = true`.
 - For very large exponents, the right parallelization target is the multiply/square itself, not independent LL chains.
 
 ## Final deliverables
