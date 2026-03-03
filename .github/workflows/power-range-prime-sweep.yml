@@ -1,17 +1,22 @@
 name: Power-Range Prime Sweep (64 Buckets)
 
 # Manual-only workflow: tests all prime exponents across 64 power-of-two
-# exponent ranges (one GitHub Actions job per bucket).
+# exponent ranges (batched into groups of ≤ 1000 primes per worker job).
 #
 # Bucket definition (1-indexed):
 #   B_1  = [2, 2]               (normalized)
 #   B_n  = [2^(n-1), 2^n - 1]  for n in [2, 64]
 #   B_64 = [2^63, 2^64 - 1]
 #
+# Runner: ubuntu-24.04 — the GitHub-hosted free-tier Linux runner with the
+#   most vCPUs (4) and RAM (16 GB).  ubuntu-22.04 only provides 2 vCPUs/7 GB.
+#   macOS runners (3 vCPU M1) are incompatible because the build requires apt-get.
+#
 # Workflow stages:
-#   1. plan    – builds the bucket matrix JSON
-#   2. worker  – 64 parallel jobs, one per bucket
-#   3. merge   – downloads all artifacts and produces a combined summary
+#   1. plan    – builds the batch matrix JSON (one entry per ≤ 1000-prime batch)
+#   2. build   – compiles the binary once and caches it
+#   3. worker  – up to 20 parallel jobs (free-tier concurrency limit), one per batch
+#   4. merge   – downloads all artifacts and produces a combined summary
 
 on:
   workflow_dispatch:
@@ -87,20 +92,24 @@ permissions:
 
 jobs:
   # ──────────────────────────────────────────────────────────
-  # Stage 1: Plan – validate inputs and build bucket matrix
+  # Stage 1: Plan – validate inputs and build the batch matrix.
+  #
+  # For each selected bucket the prime exponents are enumerated
+  # and partitioned into contiguous batches of at most 1000
+  # primes.  Each batch becomes one entry in the worker matrix.
   # ──────────────────────────────────────────────────────────
   plan:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # free-tier: 4 vCPU, 16 GB RAM (most of any free Linux runner)
     timeout-minutes: 5
     outputs:
-      bucket_matrix: ${{ steps.build-matrix.outputs.bucket_matrix }}
-      bucket_count:  ${{ steps.build-matrix.outputs.bucket_count }}
+      batch_matrix: ${{ steps.build-matrix.outputs.batch_matrix }}
+      batch_count:  ${{ steps.build-matrix.outputs.batch_count }}
     steps:
       - name: Validate confirm_run
         run: |
           if [[ "${{ inputs.confirm_run }}" != "yes" ]]; then
             echo "::error title=Confirmation required::Set confirm_run='yes' to run this workflow."
-            echo "This workflow launches up to 64 parallel GitHub Actions jobs."
+            echo "This workflow launches up to 256 parallel GitHub Actions jobs."
             echo "Provided value: '${{ inputs.confirm_run }}'"
             exit 1
           fi
@@ -119,59 +128,41 @@ jobs:
           fi
           echo "Bucket range validated: ${START}..${END}"
 
-      - name: Build bucket matrix JSON
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build batch matrix JSON
         id: build-matrix
         run: |
           START="${{ inputs.bucket_start }}"
           END="${{ inputs.bucket_end }}"
-          BUCKETS="["
-          first=true
-          for (( n=START; n<=END; n++ )); do
-            if [[ "$first" == "true" ]]; then
-              BUCKETS+="$n"
-              first=false
-            else
-              BUCKETS+=",$n"
-            fi
-          done
-          BUCKETS+="]"
-          COUNT=$(( END - START + 1 ))
-          echo "bucket_matrix=${BUCKETS}" >> "$GITHUB_OUTPUT"
-          echo "bucket_count=${COUNT}"    >> "$GITHUB_OUTPUT"
-          echo "Matrix: ${BUCKETS}"
-          echo "Total buckets: ${COUNT}"
+          DRY="${{ inputs.dry_run }}"
 
-      - name: Print plan summary
-        run: |
-          python3 - << 'PYEOF'
-          import sys
+          # Print human-readable plan (always useful for audit).
+          python3 scripts/split_bucket_batches.py \
+            --bucket-start "${START}" \
+            --bucket-end   "${END}" \
+            --batch-size   1000 \
+            --dry-run
 
-          def bucket_range(n):
-              if n == 1: return (2, 2)
-              lo = 1 << (n - 1)
-              hi = (1 << n) - 1 if n < 64 else (2**64 - 1)
-              return (lo, hi)
+          # Generate the JSON matrix (errors if > 256 batches).
+          BATCH_MATRIX=$(python3 scripts/split_bucket_batches.py \
+            --bucket-start "${START}" \
+            --bucket-end   "${END}" \
+            --batch-size   1000)
 
-          start = int("${{ inputs.bucket_start }}")
-          end   = int("${{ inputs.bucket_end }}")
-          dry   = "${{ inputs.dry_run }}" == "true"
+          BATCH_COUNT=$(echo "${BATCH_MATRIX}" | python3 -c "import json,sys; d=json.load(sys.stdin); print(len(d))")
 
-          print(f"{'Bucket':>8}  {'Lo':>22}  {'Hi':>22}  Note")
-          print("-" * 70)
-          for n in range(start, end + 1):
-              lo, hi = bucket_range(n)
-              note = "(normalized)" if n == 1 else "(UINT64_MAX)" if n == 64 else ""
-              print(f"{n:>8}  {lo:>22}  {hi:>22}  {note}")
-          print(f"\nTotal buckets: {end - start + 1}")
-          print(f"Dry-run: {dry}")
-          PYEOF
+          echo "batch_matrix=${BATCH_MATRIX}" >> "$GITHUB_OUTPUT"
+          echo "batch_count=${BATCH_COUNT}"   >> "$GITHUB_OUTPUT"
+          echo "Total batches: ${BATCH_COUNT}"
 
   # ──────────────────────────────────────────────────────────
   # Stage 2: Build – compile the binary once and cache it
   # ──────────────────────────────────────────────────────────
   build:
     needs: plan
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # free-tier: 4 vCPU, 16 GB RAM (most of any free Linux runner)
     timeout-minutes: 10
     outputs:
       cache-key: ${{ steps.cache-key.outputs.key }}
@@ -209,19 +200,24 @@ jobs:
           retention-days: 1
 
   # ──────────────────────────────────────────────────────────
-  # Stage 3: Workers – 64 parallel jobs, one per bucket
+  # Stage 3: Workers – one job per batch (≤ 1000 primes each)
+  #
+  # The batch matrix produced by the plan step drives this job.
+  # Each batch uses LL_RESUME_FROM_EXPONENT + LL_MAX_EXPONENTS_PER_JOB
+  # to select its slice of the bucket prime list without changing
+  # the C++ binary.
   # ──────────────────────────────────────────────────────────
   worker:
     needs: [plan, build]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # free-tier: 4 vCPU, 16 GB RAM (most of any free Linux runner)
     # No timeout-minutes: Mersenne prime search must not be artificially stopped.
     # Note: GitHub-hosted runners enforce a hard 6-hour cap regardless.
     # For unbounded runs (e.g., large buckets), use a self-hosted runner.
     strategy:
       fail-fast: false
-      max-parallel: 64
+      max-parallel: 20   # GitHub public free-tier hard limit for concurrent jobs
       matrix:
-        bucket_n: ${{ fromJson(needs.plan.outputs.bucket_matrix) }}
+        include: ${{ fromJson(needs.plan.outputs.batch_matrix) }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -240,80 +236,84 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libboost-dev
 
-      - name: Run bucket ${{ matrix.bucket_n }}
+      - name: Run batch ${{ matrix.worker_name }}
         id: run
         run: |
           echo "=== Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} ==="
-          echo "Job: worker – bucket ${{ matrix.bucket_n }}"
-          mkdir -p bucket_out/bucket_${{ matrix.bucket_n }}
+          echo "Job: worker – ${{ matrix.worker_name }}"
+          echo "  bucket       : ${{ matrix.bucket_n }} [${{ matrix.bucket_min }}, ${{ matrix.bucket_max }}]"
+          echo "  batch        : ${{ matrix.batch_index }} / ${{ matrix.batch_count }}"
+          echo "  prime indices: ${{ matrix.batch_prime_start_index }}..${{ matrix.batch_prime_end_index }}"
+          echo "  exponent range: ${{ matrix.batch_min_exponent }}..${{ matrix.batch_max_exponent }}"
+          echo "  batch size   : ${{ matrix.batch_size }}"
+
+          mkdir -p batch_out/
 
           LL_SWEEP_MODE=power_bucket_primes \
           LL_BUCKET_N=${{ matrix.bucket_n }} \
           LL_THREADS=${{ inputs.threads }} \
           LL_DRY_RUN=${{ inputs.dry_run && '1' || '0' }} \
           LL_REVERSE_ORDER=${{ inputs.reverse_order && '1' || '0' }} \
-          LL_MAX_EXPONENTS_PER_JOB=${{ inputs.max_exponents_per_job }} \
-          LL_RESUME_FROM_EXPONENT=${{ inputs.resume_from_exponent }} \
+          LL_RESUME_FROM_EXPONENT=${{ matrix.batch_min_exponent }} \
+          LL_MAX_EXPONENTS_PER_JOB=${{ matrix.batch_size }} \
           LL_STOP_AFTER_FIRST_PRIME_RESULT=${{ inputs.stop_after_first_prime_result && '1' || '0' }} \
           LL_BENCHMARK_MODE=${{ inputs.benchmark_mode && '1' || '0' }} \
           LL_PROGRESS=${{ inputs.progress && '1' || '0' }} \
           LL_PROGRESS_INTERVAL_ITERS=${{ inputs.progress_interval_iters }} \
           LL_PROGRESS_INTERVAL_SECONDS=${{ inputs.progress_interval_seconds }} \
-          LL_OUTPUT_DIR=bucket_out/ \
+          LL_OUTPUT_DIR=batch_out/ \
           GITHUB_STEP_SUMMARY="${GITHUB_STEP_SUMMARY}" \
           ./bin/bignum 0 ${{ inputs.threads }}
 
-          if [ -f "bucket_out/bucket_${{ matrix.bucket_n }}/discovery_event.json" ]; then
+          if [ -f "batch_out/bucket_${{ matrix.bucket_n }}/discovery_event.json" ]; then
             echo "new_discovery=true" >> "$GITHUB_OUTPUT"
-            echo "::notice title=NEW MERSENNE PRIME FOUND::Bucket ${{ matrix.bucket_n }} found a new prime!"
+            echo "::notice title=NEW MERSENNE PRIME FOUND::Batch ${{ matrix.worker_name }} found a new prime!"
           else
             echo "new_discovery=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Upload bucket artifacts
+      - name: Upload batch artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: bucket-${{ matrix.bucket_n }}-results
-          path: bucket_out/bucket_${{ matrix.bucket_n }}/
+          name: ${{ matrix.worker_name }}-results
+          path: batch_out/bucket_${{ matrix.bucket_n }}/
           retention-days: 90
           if-no-files-found: warn
 
   # ──────────────────────────────────────────────────────────
-  # Stage 4: Merge – aggregate all bucket results
+  # Stage 4: Merge – aggregate all batch results
   # ──────────────────────────────────────────────────────────
   merge:
     needs: worker
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # free-tier: 4 vCPU, 16 GB RAM (most of any free Linux runner)
     timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Download all bucket artifacts
+      - name: Download all batch artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: bucket-*-results
-          path: bucket_out/
+          pattern: bucket-*-batch-*-results
+          path: batch_artifacts/
           merge-multiple: false
 
-      - name: Reorganize artifacts into bucket subdirectories
+      - name: Reorganize batch artifacts for merge script
         run: |
-          # Actions download-artifact places each artifact in its own dir;
-          # reorganize to match the expected bucket_out/bucket_N/ layout.
-          for dir in bucket_out/bucket-*-results; do
-            [ -d "$dir" ] || continue
-            n=$(echo "$dir" | grep -oP '(?<=bucket-)\d+(?=-results)')
-            target="bucket_out/bucket_${n}"
-            mkdir -p "$target"
-            cp -r "$dir"/. "$target/"
-          done
+          # The merge script scans recursively, so just ensure the root dir
+          # is accessible.  Copy all downloaded artifacts into bucket_out/
+          # preserving subdirectory structure.
+          mkdir -p bucket_out/
+          if [ -d batch_artifacts/ ]; then
+            cp -r batch_artifacts/. bucket_out/
+          fi
 
       - name: Install Python (for merge script)
         run: python3 --version  # already available on ubuntu-latest
 
-      - name: Merge bucket results
+      - name: Merge batch results
         id: merge
         run: |
           python3 scripts/merge_bucket_results.py \
