@@ -87,11 +87,6 @@ on:
         default: "0"
   workflow_dispatch:
     inputs:
-      confirm_run:
-        description: "Type 'yes' to confirm this large multi-job sweep"
-        required: true
-        type: string
-        default: "yes"
       bucket_start:
         description: "First bucket to run (1-64)"
         required: false
@@ -170,16 +165,6 @@ jobs:
       batch_matrix: ${{ steps.build-matrix.outputs.batch_matrix }}
       batch_count:  ${{ steps.build-matrix.outputs.batch_count }}
     steps:
-      - name: Validate confirm_run
-        if: github.event_name == 'workflow_dispatch'
-        run: |
-          if [[ "${{ inputs.confirm_run }}" != "yes" ]]; then
-            echo "::error title=Confirmation required::Set confirm_run='yes' to run this workflow."
-            echo "This workflow launches up to 256 parallel GitHub Actions jobs."
-            echo "Provided value: '${{ inputs.confirm_run }}'"
-            exit 1
-          fi
-
       - name: Validate bucket range
         run: |
           START="${{ inputs.bucket_start }}"
