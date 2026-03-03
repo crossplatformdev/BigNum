@@ -1,16 +1,36 @@
 #!/usr/bin/env python3
 """
-merge_bucket_results.py – Merge per-bucket CSV/JSON artifacts into a combined report.
+merge_bucket_results.py – Merge per-bucket/per-batch CSV/JSON artifacts into a
+combined report.
 
 Usage:
     python3 scripts/merge_bucket_results.py [--dir <output_dir>] [--out <output_prefix>]
 
-The script scans <output_dir> (default: bucket_out/) for files matching
-bucket_*_results.{csv,json}, merges them, and writes:
+The script scans <output_dir> (default: bucket_out/) recursively for files
+matching bucket_*_results.{csv,json}, merges them, and writes:
     <output_prefix>_all_results.csv
     <output_prefix>_all_results.json
     <output_prefix>_summary.md
     <output_prefix>_new_discoveries.json   (if any new Mersenne primes found)
+
+Batch support: when the power-range-prime-sweep workflow runs with batching
+enabled, each batch worker uploads an artifact named
+``bucket-{N}-batch-{start}-{end}-exp-{pmin}-{pmax}-results``.  After all
+artifacts are downloaded the directory tree looks like:
+
+    bucket_out/
+      bucket-17-batch-0001-1000-exp-65537-65867-results/
+        bucket_17/
+          bucket_17_results.csv
+          bucket_17_results.json
+      bucket-17-batch-1001-2000-exp-65869-66107-results/
+        bucket_17/
+          bucket_17_results.csv
+          ...
+
+This script scans recursively so it finds result files in any subdirectory
+depth, making it compatible with both the old (one artifact per bucket) and
+new (one artifact per batch) layouts.
 """
 
 import argparse
@@ -23,13 +43,15 @@ from pathlib import Path
 
 
 def scan_csv_files(output_dir: str) -> list[str]:
-    pattern = os.path.join(output_dir, "bucket_*", "bucket_*_results.csv")
-    return sorted(glob.glob(pattern))
+    """Return all bucket_*_results.csv files found anywhere under output_dir."""
+    pattern = os.path.join(output_dir, "**", "bucket_*_results.csv")
+    return sorted(glob.glob(pattern, recursive=True))
 
 
 def scan_json_files(output_dir: str) -> list[str]:
-    pattern = os.path.join(output_dir, "bucket_*", "bucket_*_results.json")
-    return sorted(glob.glob(pattern))
+    """Return all bucket_*_results.json files found anywhere under output_dir."""
+    pattern = os.path.join(output_dir, "**", "bucket_*_results.json")
+    return sorted(glob.glob(pattern, recursive=True))
 
 
 def merge_csv(csv_files: list[str]) -> list[dict]:
@@ -70,6 +92,11 @@ def _elapsed(r) -> float:
         return float(r.get("elapsed_sec", 0.0) or 0.0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _fmt_elapsed(r) -> str:
+    """Return elapsed time formatted to 3 decimal places."""
+    return f"{_elapsed(r):.3f}"
 
 
 def write_merged_csv(rows: list[dict], out_path: str) -> None:
@@ -115,36 +142,97 @@ def write_summary_md(
     ]
 
     # -------------------------------------------------------------------
-    # Bucket timing summary
+    # Bucket + batch summary (grouped: bucket → batch → exponent)
     # -------------------------------------------------------------------
+
+    # Collect per-bucket data (for aggregate row)
     bucket_data: dict[int, dict] = {}
+    # Collect per-batch data keyed by (bucket_n, batch_index)
+    batch_data: dict[tuple, dict] = {}
+
     for r in results:
         n = int(r.get("bucket_n", 0))
+        batch_idx = r.get("batch_index")
+
+        # Bucket aggregate
         if n not in bucket_data:
-            bucket_data[n] = {"count": 0, "total_sec": 0.0, "max_sec": 0.0}
+            bucket_data[n] = {
+                "count": 0,
+                "total_sec": 0.0,
+                "max_sec": 0.0,
+                "batch_indices": set(),
+            }
         bucket_data[n]["count"] += 1
         t = _elapsed(r)
         bucket_data[n]["total_sec"] += t
         if t > bucket_data[n]["max_sec"]:
             bucket_data[n]["max_sec"] = t
 
+        # Batch aggregate (only when batch metadata is present)
+        if batch_idx is not None:
+            bkey = (n, int(batch_idx))
+            if bkey not in batch_data:
+                batch_data[bkey] = {
+                    "count": 0,
+                    "total_sec": 0.0,
+                    "max_sec": 0.0,
+                    "batch_min_exponent": r.get("batch_min_exponent", ""),
+                    "batch_max_exponent": r.get("batch_max_exponent", ""),
+                    "known_mersenne": 0,
+                    "new_discoveries": 0,
+                }
+            bd = batch_data[bkey]
+            bd["count"] += 1
+            bd["total_sec"] += t
+            if t > bd["max_sec"]:
+                bd["max_sec"] = t
+            if _is_true(r.get("is_known_mersenne_prime", False)):
+                bd["known_mersenne"] += 1
+            if _is_true(r.get("is_new_discovery", False)):
+                bd["new_discoveries"] += 1
+            bucket_data[n]["batch_indices"].add(int(batch_idx))
+
     if bucket_data:
         lines += [
             "## Bucket Timing Summary",
             "",
-            "| Bucket n | Exponents tested | Total time (s)"
+            "| Bucket n | Exponents tested | Batches | Total time (s)"
             " | Avg time (s) | Longest (s) |",
-            "|----------|-----------------|---------------|"
+            "|----------|-----------------|---------|---------------|"
             "-------------|------------|",
         ]
         for n in sorted(bucket_data):
             d = bucket_data[n]
             avg = d["total_sec"] / d["count"] if d["count"] else 0.0
+            nb = len(d.get("batch_indices", set())) or "—"
             lines.append(
                 f"| {n} | {d['count']}"
+                f" | {nb}"
                 f" | {d['total_sec']:.3f}"
                 f" | {avg:.3f}"
                 f" | {d['max_sec']:.3f} |"
+            )
+        lines.append("")
+
+    if batch_data:
+        lines += [
+            "## Batch Summary",
+            "",
+            "| Bucket n | Batch idx | Exponent range"
+            " | Exponents | Total time (s) | Known Mersenne | New Discoveries |",
+            "|----------|-----------|---------------|"
+            "-----------|----------------|----------------|-----------------|",
+        ]
+        for (n, bi) in sorted(batch_data.keys()):
+            bd = batch_data[(n, bi)]
+            exp_range = f"{bd['batch_min_exponent']}–{bd['batch_max_exponent']}"
+            lines.append(
+                f"| {n} | {bi}"
+                f" | {exp_range}"
+                f" | {bd['count']}"
+                f" | {bd['total_sec']:.3f}"
+                f" | {bd['known_mersenne']}"
+                f" | {bd['new_discoveries']} |"
             )
         lines.append("")
 
@@ -168,7 +256,7 @@ def write_summary_md(
                 f"| {r['exponent']}"
                 f" | {r.get('bucket_n', '')}"
                 f" | {r.get('backend', '')}"
-                f" | {_elapsed(r):.3f}"
+                f" | {_fmt_elapsed(r)}"
                 f" | `{r.get('final_residue_hex', '0000000000000000')}` |"
             )
         lines.append("")
@@ -193,7 +281,7 @@ def write_summary_md(
                 f"| **{d['exponent']}**"
                 f" | {d.get('bucket_n', '')}"
                 f" | {d.get('backend', '')}"
-                f" | {_elapsed(d):.3f}"
+                f" | {_fmt_elapsed(d)}"
                 f" | `{d.get('final_residue_hex', '')}` |"
             )
         lines.append("")
@@ -214,10 +302,34 @@ def write_summary_md(
                 f"| {r['exponent']}"
                 f" | {r.get('bucket_n', '')}"
                 f" | {r.get('backend', '')}"
-                f" | {_elapsed(r):.3f}"
+                f" | {_fmt_elapsed(r)}"
                 f" | `{r.get('final_residue_hex', '')}` |"
             )
         lines.append("")
+
+    # -------------------------------------------------------------------
+    # Full per-exponent results table
+    # -------------------------------------------------------------------
+    lines += [
+        f"## All Exponent Results ({total})",
+        "",
+        "| Mersenne Exponent | Time of the Test (s) | Result | Residue | New (y/n) |",
+        "|-------------------|----------------------|--------|---------|-----------|",
+    ]
+    for r in results:
+        exp     = r.get("exponent", "")
+        elapsed = _fmt_elapsed(r)
+        result  = r.get("result", "")
+        residue = r.get("final_residue_hex", "") or r.get("final_residue", "")
+        is_new  = "y" if _is_true(r.get("is_new_discovery", False)) else "n"
+        lines.append(
+            f"| {exp}"
+            f" | {elapsed}"
+            f" | {result}"
+            f" | `{residue}`"
+            f" | {is_new} |"
+        )
+    lines.append("")
 
     with open(out_path, "w") as f:
         f.write("\n".join(lines) + "\n")
