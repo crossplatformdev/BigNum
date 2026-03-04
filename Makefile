@@ -24,7 +24,7 @@ PERF_CXXFLAGS := -std=c++20 -O3 -g -fno-omit-frame-pointer -march=native -mtune=
 PERF_LDFLAGS  := -pthread
 
 # callgrind build: -O2 with frame pointers for Valgrind/Callgrind, no LTO.
-CALLGRIND_CXXFLAGS := -std=c++20 -O2 -g -fno-omit-frame-pointer -march=native -pthread -Wall -Wextra
+CALLGRIND_CXXFLAGS := -std=c++20 -O2 -g -fno-omit-frame-pointer -march=native -mtune=native -pthread -Wall -Wextra -Wpedantic
 CALLGRIND_LDFLAGS  := -pthread
 
 .PHONY: all clean unit smoke regression test bench bench-ci prof perf-build callgrind-build perf-run callgrind-run discover discover-dry-run manual-sweep bucket bucket-dry-run plan-tool
