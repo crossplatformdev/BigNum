@@ -82,6 +82,11 @@ on:
         required: false
         type: string
         default: "360"
+      target_workers:
+        description: "Target number of parallel workers (default: 250). The total primes are divided across this many workers; the time-limit cap still applies as a safety bound."
+        required: false
+        type: string
+        default: "250"
       benchmark_mode:
         description: "Skip is_prime_exponent() check (safe only for known-prime lists)"
         required: false
@@ -154,6 +159,11 @@ on:
         required: false
         type: string
         default: "360"
+      target_workers:
+        description: "Target number of parallel workers (default: 250). The total primes are divided across this many workers; the time-limit cap still applies as a safety bound."
+        required: false
+        type: string
+        default: "250"
       benchmark_mode:
         description: "Skip is_prime_exponent() check (safe only for known-prime lists)"
         required: false
@@ -182,11 +192,11 @@ jobs:
   # ──────────────────────────────────────────────────────────
   # Stage 1: Plan – validate inputs and build the batch matrix.
   #
-  # For each selected bucket the prime exponents are enumerated
-  # and partitioned into batches sized by the inverse rule of
-  # three:  batch_size = floor(time_limit / worst_case_time).
-  # Already-tested exponents are skipped automatically when
-  # auto_resume=true (reads from bucket_artifacts/ names).
+  # The plan tool counts all remaining primes, then splits them
+  # into ceil(total / target_workers) primes per batch, targeting
+  # ~250 parallel workers.  The per-bucket time-limit cap ensures
+  # no single worker can exceed the 6-hour GitHub Actions limit.
+  # Already-tested exponents are skipped when auto_resume=true.
   # ──────────────────────────────────────────────────────────
   plan:
     runs-on: ubuntu-24.04  # free-tier: 4 vCPU, 16 GB RAM (most of any free Linux runner)
@@ -258,6 +268,7 @@ jobs:
           bin/split_bucket_batches \
             --bucket-start          "${START}" \
             --bucket-end            "${END}" \
+            --target-workers        "${{ inputs.target_workers }}" \
             --time-limit-seconds    "${TIME_LIMIT_SEC}" \
             --resume-from-exponent  "${EFFECTIVE_RESUME}" \
             --dry-run
@@ -266,12 +277,14 @@ jobs:
           BATCH_MATRIX=$(bin/split_bucket_batches \
             --bucket-start          "${START}" \
             --bucket-end            "${END}" \
+            --target-workers        "${{ inputs.target_workers }}" \
             --time-limit-seconds    "${TIME_LIMIT_SEC}" \
             --resume-from-exponent  "${EFFECTIVE_RESUME}")
 
           BATCH_COUNT=$(bin/split_bucket_batches \
             --bucket-start          "${START}" \
             --bucket-end            "${END}" \
+            --target-workers        "${{ inputs.target_workers }}" \
             --time-limit-seconds    "${TIME_LIMIT_SEC}" \
             --resume-from-exponent  "${EFFECTIVE_RESUME}" \
             --count-only)
@@ -324,12 +337,13 @@ jobs:
           retention-days: 1
 
   # ──────────────────────────────────────────────────────────
-  # Stage 3: Workers – one job per batch (≤ 1000 primes each)
+  # Stage 3: Workers – one job per batch, targeting ~250 workers
   #
   # The batch matrix produced by the plan step drives this job.
-  # Each batch uses LL_RESUME_FROM_EXPONENT + LL_MAX_EXPONENTS_PER_JOB
-  # to select its slice of the bucket prime list without changing
-  # the C++ binary.
+  # With target_workers=250 and max-parallel=256, all workers
+  # start concurrently (up to the GitHub matrix hard cap of 256),
+  # so the entire sweep finishes in roughly the time it takes the
+  # slowest single worker batch.
   # ──────────────────────────────────────────────────────────
   worker:
     needs: [plan, build]
@@ -339,7 +353,7 @@ jobs:
     # For unbounded runs (e.g., large buckets), use a self-hosted runner.
     strategy:
       fail-fast: false
-      max-parallel: 20   # GitHub public free-tier hard limit for concurrent jobs
+      max-parallel: 256   # allow all workers to run concurrently (GitHub matrix hard cap)
       matrix:
         include: ${{ fromJson(needs.plan.outputs.batch_matrix) }}
     steps:

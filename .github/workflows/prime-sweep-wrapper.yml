@@ -34,6 +34,11 @@ on:
         required: false
         type: string
         default: "360"
+      target_workers:
+        description: "Target number of parallel workers (default: 250). Primes are split across this many workers so they run concurrently."
+        required: false
+        type: string
+        default: "250"
 
 permissions:
   contents: read
@@ -73,6 +78,7 @@ jobs:
       bucket_end:         ${{ inputs.bucket_top }}
       auto_resume:        ${{ inputs.auto_resume }}
       time_limit_minutes: ${{ inputs.time_limit_minutes }}
+      target_workers:     ${{ inputs.target_workers }}
 
   # ──────────────────────────────────────────────────────────
   # Stage 3: Report – download the merged artifact produced by

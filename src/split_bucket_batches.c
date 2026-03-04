@@ -9,6 +9,7 @@
  *                        [--batch-size N]
  *                        [--time-limit-seconds S]
  *                        [--resume-from-exponent N]
+ *                        [--target-workers N]
  *                        [--dry-run]
  *                        [--output FILE] [--count-only]
  *
@@ -16,6 +17,13 @@
  *   B_1  = [2, 2]
  *   B_n  = [2^(n-1), 2^n - 1]  for n >= 2
  *   B_64 = [2^63, 2^64 - 1]
+ *
+ * --target-workers N
+ *   Compute batch sizes so that the total number of batches is as close to N
+ *   as possible.  The algorithm counts total remaining primes across all
+ *   selected buckets and sets batch_size = ceil(total / N).  The per-bucket
+ *   time-limit cap still applies so no worker exceeds the budget.
+ *   --batch-size acts as a hard upper cap on top of this.
  *
  * --time-limit-seconds S
  *   Compute a per-bucket batch size using the inverse rule of three:
@@ -365,6 +373,7 @@ int main(int argc, char **argv)
     size_t      batch_size       = BATCH_SIZE_DEFAULT;
     double      time_limit_sec   = 0.0;   /* 0 = use --batch-size only */
     uint64_t    resume_from      = 0;     /* 0 = no skip               */
+    size_t      target_workers   = 0;     /* 0 = off                   */
     int         dry_run          = 0;
     int         count_only       = 0;
     const char *output_file      = NULL;
@@ -380,6 +389,8 @@ int main(int argc, char **argv)
             time_limit_sec = parse_nonneg_double("--time-limit-seconds", argv[++i]);
         else if (!strcmp(argv[i], "--resume-from-exponent") && i + 1 < argc)
             resume_from    = parse_nonneg_uint64("--resume-from-exponent", argv[++i]);
+        else if (!strcmp(argv[i], "--target-workers")      && i + 1 < argc)
+            target_workers = parse_positive_int("--target-workers", argv[++i]);
         else if (!strcmp(argv[i], "--dry-run"))
             dry_run        = 1;
         else if (!strcmp(argv[i], "--count-only"))
@@ -410,17 +421,45 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* Enumerate all batches across the selected bucket range. */
+    /* ── Step 1: count total remaining primes across all buckets ────────── */
+    size_t total_remaining = 0;
+    if (target_workers > 0) {
+        for (int n = bucket_start; n <= bucket_end; n++) {
+            U64Vec primes = enumerate_bucket_primes(n);
+            size_t skip = 0;
+            if (resume_from > 0) {
+                while (skip < primes.size && primes.data[skip] <= resume_from)
+                    skip++;
+            }
+            total_remaining += (primes.size > skip) ? (primes.size - skip) : 0;
+            free(primes.data);
+        }
+    }
+
+    /* ── Step 2: compute global target batch size ─────────────────────── */
+    size_t global_target_bs;
+    if (target_workers > 0 && total_remaining > 0) {
+        /* ceil division: batch_size = ceil(total / target_workers) */
+        global_target_bs = (total_remaining + target_workers - 1) / target_workers;
+    } else {
+        global_target_bs = batch_size;
+    }
+
+    /* ── Step 3: enumerate batches with per-bucket caps ──────────────── */
     BatchVec matrix = {NULL, 0, 0};
     for (int n = bucket_start; n <= bucket_end; n++) {
-        size_t bs;
+        /* Start with the global target */
+        size_t bs = global_target_bs;
+
+        /* Hard upper cap from --batch-size */
+        if (bs > batch_size) bs = batch_size;
+
+        /* Per-bucket time-limit safety cap */
         if (time_limit_sec > 0.0) {
-            /* Per-bucket batch size from timing data, capped by --batch-size. */
             size_t tl_bs = batch_size_for_bucket(n, time_limit_sec);
-            bs = (tl_bs < batch_size) ? tl_bs : batch_size;
-        } else {
-            bs = batch_size;
+            if (tl_bs < bs) bs = tl_bs;
         }
+
         BatchVec bv = split_bucket_into_batches(n, bs, resume_from);
         for (size_t j = 0; j < bv.size; j++)
             batch_push(&matrix, &bv.data[j]);
@@ -438,6 +477,9 @@ int main(int argc, char **argv)
     if (dry_run) {
         printf("bucket_start         : %d\n", bucket_start);
         printf("bucket_end           : %d\n", bucket_end);
+        if (target_workers > 0)
+            printf("target_workers       : %zu  (total remaining primes: %zu)\n",
+                   target_workers, total_remaining);
         if (time_limit_sec > 0.0) {
             printf("time_limit_seconds   : %.0f  (%.1f h per worker)\n",
                    time_limit_sec, time_limit_sec / 3600.0);

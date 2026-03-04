@@ -209,25 +209,66 @@ def generate_batch_matrix(
     batch_size: int = BATCH_SIZE_DEFAULT,
     time_limit_seconds: float = 0.0,
     resume_from: int = 0,
+    target_workers: int = 0,
 ) -> list[dict]:
     """Return the full batch matrix across all selected buckets.
 
     Args:
         batch_size:         Global maximum primes per batch (used when
-                            *time_limit_seconds* is 0).
+                            *time_limit_seconds* and *target_workers* are 0).
         time_limit_seconds: When > 0, compute a per-bucket batch size via
-                            the inverse rule of three and use that instead.
-                            *batch_size* then acts as an upper cap.
+                            the inverse rule of three and use that as a safety
+                            cap.  *batch_size* also acts as an upper cap.
         resume_from:        Skip primes ≤ this value in the first affected
                             bucket; skip completed buckets entirely.
+        target_workers:     When > 0, compute batch sizes so that the total
+                            number of batches across all buckets is as close
+                            to *target_workers* as possible.  This is done by
+                            counting total remaining primes and setting
+                            batch_size = ceil(total / target_workers).
+                            The time-limit cap still applies per bucket so
+                            no single worker can exceed the time budget.
     """
-    matrix: list[dict] = []
+    # ── Step 1: collect all remaining primes per bucket ──────────────────
+    bucket_primes: list[tuple[int, list[int]]] = []  # (bucket_n, primes_remaining)
     for n in range(bucket_start, bucket_end + 1):
+        primes = enumerate_bucket_primes(n)
+        if not primes:
+            continue
+        skip = 0
+        if resume_from > 0:
+            while skip < len(primes) and primes[skip] <= resume_from:
+                skip += 1
+        remaining = primes[skip:]
+        if remaining:
+            bucket_primes.append((n, remaining))
+
+    if not bucket_primes:
+        return []
+
+    # ── Step 2: compute the global "target" batch size ────────────────────
+    if target_workers > 0:
+        total_remaining = sum(len(r) for _, r in bucket_primes)
+        global_target_bs = max(1, -(-total_remaining // target_workers))  # ceil division
+    else:
+        global_target_bs = batch_size  # use explicit --batch-size as-is
+
+    # ── Step 3: per-bucket effective batch size ───────────────────────────
+    matrix: list[dict] = []
+    for n, _ in bucket_primes:
+        # Start with the global target
+        bs = global_target_bs
+
+        # Always cap by --batch-size (hard upper limit)
+        bs = min(bs, batch_size)
+
+        # Cap by time-limit safety (per bucket) when a budget is given
         if time_limit_seconds > 0.0:
-            bs = min(batch_size, max_batch_size_for_bucket(n, time_limit_seconds))
-        else:
-            bs = batch_size
+            tl_bs = max_batch_size_for_bucket(n, time_limit_seconds)
+            bs = min(bs, tl_bs)
+
         matrix.extend(split_bucket_into_batches(n, bs, resume_from))
+
     return matrix
 
 
@@ -247,6 +288,13 @@ def main() -> None:
                              "rule of three from benchmark timing data, then capped "
                              "by --batch-size.  Overrides a plain --batch-size for "
                              "large-exponent buckets.")
+    parser.add_argument("--target-workers", type=int, default=0,
+                        metavar="N",
+                        help="Target total number of worker batches across all buckets.  "
+                             "The batch size is computed as ceil(total_primes / N) so the "
+                             "sweep uses ~N parallel workers.  The per-bucket time-limit "
+                             "cap still applies so no worker exceeds the time budget.  "
+                             "--batch-size acts as a hard upper cap.  (default: 0 = off)")
     parser.add_argument("--resume-from-exponent", type=int, default=0,
                         metavar="N",
                         help="Skip all prime exponents ≤ N.  Batches whose highest "
@@ -270,6 +318,8 @@ def main() -> None:
         parser.error(f"--time-limit-seconds must be >= 0, got {args.time_limit_seconds}")
     if args.resume_from_exponent < 0:
         parser.error(f"--resume-from-exponent must be >= 0, got {args.resume_from_exponent}")
+    if args.target_workers < 0:
+        parser.error(f"--target-workers must be >= 0, got {args.target_workers}")
 
     matrix = generate_batch_matrix(
         args.bucket_start,
@@ -277,11 +327,14 @@ def main() -> None:
         batch_size=args.batch_size,
         time_limit_seconds=args.time_limit_seconds,
         resume_from=args.resume_from_exponent,
+        target_workers=args.target_workers,
     )
 
     if args.dry_run:
         print(f"bucket_start         : {args.bucket_start}")
         print(f"bucket_end           : {args.bucket_end}")
+        if args.target_workers > 0:
+            print(f"target_workers       : {args.target_workers}")
         if args.time_limit_seconds > 0:
             print(f"time_limit_seconds   : {args.time_limit_seconds:.0f}  "
                   f"({args.time_limit_seconds/3600:.1f} h per worker)")
