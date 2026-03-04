@@ -1,7 +1,7 @@
 name: Power-Range Prime Sweep (64 Buckets)
 
 # Manual-only workflow: tests all prime exponents across 64 power-of-two
-# exponent ranges (batched into groups of ≤ 1000 primes per worker job).
+# exponent ranges (batched into groups sized to fit within the time limit).
 #
 # Bucket definition (1-indexed):
 #   B_1  = [2, 2]               (normalized)
@@ -12,8 +12,15 @@ name: Power-Range Prime Sweep (64 Buckets)
 #   most vCPUs (4) and RAM (16 GB).  ubuntu-22.04 only provides 2 vCPUs/7 GB.
 #   macOS runners (3 vCPU M1) are incompatible because the build requires apt-get.
 #
+# Batch sizing strategy:
+#   The plan stage uses the inverse rule of three to compute per-bucket batch
+#   sizes from measured benchmark timing data (see REPORT_MERSENNE_EXPONENTS-*).
+#   The formula is: batch_size = floor(time_limit_seconds / worst_case_time_per_prime)
+#   This ensures each worker completes in well under the 6-hour GitHub cap.
+#
 # Workflow stages:
-#   1. plan    – builds the batch matrix JSON (one entry per ≤ 1000-prime batch)
+#   1. plan    – auto-detects last tested exponent, builds the batch matrix
+#                with per-bucket batch sizes derived from timing data
 #   2. build   – compiles the binary once and caches it
 #   3. worker  – up to 20 parallel jobs (free-tier concurrency limit), one per batch
 #   4. merge   – downloads all artifacts and produces a combined summary
@@ -61,10 +68,25 @@ on:
         type: boolean
         default: false
       resume_from_exponent:
-        description: "Skip exponents below this value (0 = no skip)"
+        description: "Skip exponents ≤ this value (0 = use auto_resume result or no skip)"
         required: false
         type: string
         default: "0"
+      auto_resume:
+        description: "Auto-detect the last tested exponent from bucket_artifacts/ and resume from there (overridden by resume_from_exponent if > 0)"
+        required: false
+        type: boolean
+        default: true
+      time_limit_minutes:
+        description: "Per-worker time budget in minutes; batch sizes are scaled per-bucket so each worker finishes within this limit (default: 360 = 6 h)"
+        required: false
+        type: string
+        default: "360"
+      target_workers:
+        description: "Target number of parallel workers (default: 250). The total primes are divided across this many workers; the time-limit cap still applies as a safety bound."
+        required: false
+        type: string
+        default: "250"
       benchmark_mode:
         description: "Skip is_prime_exponent() check (safe only for known-prime lists)"
         required: false
@@ -123,10 +145,25 @@ on:
         type: boolean
         default: false
       resume_from_exponent:
-        description: "Skip exponents below this value (0 = no skip)"
+        description: "Skip exponents ≤ this value (0 = use auto_resume result or no skip)"
         required: false
         type: string
         default: "0"
+      auto_resume:
+        description: "Auto-detect the last tested exponent from bucket_artifacts/ and resume from there (overridden by resume_from_exponent if > 0)"
+        required: false
+        type: boolean
+        default: true
+      time_limit_minutes:
+        description: "Per-worker time budget in minutes; batch sizes are scaled per-bucket so each worker finishes within this limit (default: 360 = 6 h)"
+        required: false
+        type: string
+        default: "360"
+      target_workers:
+        description: "Target number of parallel workers (default: 250). The total primes are divided across this many workers; the time-limit cap still applies as a safety bound."
+        required: false
+        type: string
+        default: "250"
       benchmark_mode:
         description: "Skip is_prime_exponent() check (safe only for known-prime lists)"
         required: false
@@ -155,15 +192,18 @@ jobs:
   # ──────────────────────────────────────────────────────────
   # Stage 1: Plan – validate inputs and build the batch matrix.
   #
-  # For each selected bucket the prime exponents are enumerated
-  # and partitioned into contiguous batches of at most 1000
-  # primes.  Each batch becomes one entry in the worker matrix.
+  # The plan tool counts all remaining primes, then splits them
+  # into ceil(total / target_workers) primes per batch, targeting
+  # ~250 parallel workers.  The per-bucket time-limit cap ensures
+  # no single worker can exceed the 6-hour GitHub Actions limit.
+  # Already-tested exponents are skipped when auto_resume=true.
   # ──────────────────────────────────────────────────────────
   plan:
     runs-on: ubuntu-24.04  # free-tier: 4 vCPU, 16 GB RAM (most of any free Linux runner)
     outputs:
-      batch_matrix: ${{ steps.build-matrix.outputs.batch_matrix }}
-      batch_count:  ${{ steps.build-matrix.outputs.batch_count }}
+      batch_matrix:      ${{ steps.build-matrix.outputs.batch_matrix }}
+      batch_count:       ${{ steps.build-matrix.outputs.batch_count }}
+      effective_resume:  ${{ steps.build-matrix.outputs.effective_resume }}
     steps:
       - name: Validate bucket range
         run: |
@@ -177,7 +217,19 @@ jobs:
             echo "::error::bucket_start ($START) and bucket_end ($END) must both be in [1,64] with start <= end."
             exit 1
           fi
+          TIME_LIMIT="${{ inputs.time_limit_minutes }}"
+          if ! [[ "$TIME_LIMIT" =~ ^[0-9]+$ ]] || (( TIME_LIMIT < 1 )); then
+            echo "::error::time_limit_minutes must be a positive integer, got '${TIME_LIMIT}'."
+            exit 1
+          fi
+          TARGET_WORKERS="${{ inputs.target_workers }}"
+          if ! [[ "$TARGET_WORKERS" =~ ^[0-9]+$ ]]; then
+            echo "::error::target_workers must be a non-negative integer, got '${TARGET_WORKERS}'."
+            exit 1
+          fi
           echo "Bucket range validated: ${START}..${END}"
+          echo "time_limit_minutes validated: ${TIME_LIMIT}"
+          echo "target_workers validated: ${TARGET_WORKERS}"
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -187,33 +239,71 @@ jobs:
           mkdir -p bin
           gcc -std=c11 -O2 -o bin/split_bucket_batches src/split_bucket_batches.c
 
+      - name: Auto-detect last tested exponent
+        id: auto-resume
+        run: |
+          # Scan committed bucket_artifacts/ filenames for the highest tested
+          # exponent.  This is the resume point if auto_resume is enabled.
+          AUTO_EXP=$(python3 scripts/find_resume_exponent.py bucket_artifacts/ 2>/dev/null || echo "0")
+          echo "last_exponent=${AUTO_EXP}" >> "$GITHUB_OUTPUT"
+          echo "Auto-resume scan: last tested exponent = ${AUTO_EXP}"
+
       - name: Build batch matrix JSON
         id: build-matrix
         run: |
           START="${{ inputs.bucket_start }}"
           END="${{ inputs.bucket_end }}"
 
+          # Determine effective resume exponent:
+          #   - explicit resume_from_exponent input wins if > 0
+          #   - otherwise fall back to the auto-detected value (when auto_resume=true)
+          INPUT_RESUME="${{ inputs.resume_from_exponent }}"
+          AUTO_EXP="${{ steps.auto-resume.outputs.last_exponent }}"
+          AUTO_ENABLED="${{ inputs.auto_resume }}"
+
+          if [[ "${INPUT_RESUME}" -gt 0 ]]; then
+            EFFECTIVE_RESUME="${INPUT_RESUME}"
+            echo "Resume: using explicit input resume_from_exponent=${EFFECTIVE_RESUME}"
+          elif [[ "${AUTO_ENABLED}" == "true" && "${AUTO_EXP}" -gt 0 ]]; then
+            EFFECTIVE_RESUME="${AUTO_EXP}"
+            echo "Resume: auto-detected last tested exponent=${EFFECTIVE_RESUME}"
+          else
+            EFFECTIVE_RESUME="0"
+            echo "Resume: starting from the beginning (no resume point)"
+          fi
+
+          # Per-worker time limit (seconds) for per-bucket batch sizing.
+          TIME_LIMIT_SEC=$(( ${{ inputs.time_limit_minutes }} * 60 ))
+          echo "Time limit per worker: ${TIME_LIMIT_SEC}s (${{ inputs.time_limit_minutes }} min)"
+
           # Print human-readable plan (always useful for audit).
           bin/split_bucket_batches \
-            --bucket-start "${START}" \
-            --bucket-end   "${END}" \
-            --batch-size   1000 \
+            --bucket-start          "${START}" \
+            --bucket-end            "${END}" \
+            --target-workers        "${{ inputs.target_workers }}" \
+            --time-limit-seconds    "${TIME_LIMIT_SEC}" \
+            --resume-from-exponent  "${EFFECTIVE_RESUME}" \
             --dry-run
 
           # Generate the JSON matrix (errors if > 256 batches).
           BATCH_MATRIX=$(bin/split_bucket_batches \
-            --bucket-start "${START}" \
-            --bucket-end   "${END}" \
-            --batch-size   1000)
+            --bucket-start          "${START}" \
+            --bucket-end            "${END}" \
+            --target-workers        "${{ inputs.target_workers }}" \
+            --time-limit-seconds    "${TIME_LIMIT_SEC}" \
+            --resume-from-exponent  "${EFFECTIVE_RESUME}")
 
           BATCH_COUNT=$(bin/split_bucket_batches \
-            --bucket-start "${START}" \
-            --bucket-end   "${END}" \
-            --batch-size   1000 \
+            --bucket-start          "${START}" \
+            --bucket-end            "${END}" \
+            --target-workers        "${{ inputs.target_workers }}" \
+            --time-limit-seconds    "${TIME_LIMIT_SEC}" \
+            --resume-from-exponent  "${EFFECTIVE_RESUME}" \
             --count-only)
 
-          echo "batch_matrix=${BATCH_MATRIX}" >> "$GITHUB_OUTPUT"
-          echo "batch_count=${BATCH_COUNT}"   >> "$GITHUB_OUTPUT"
+          echo "batch_matrix=${BATCH_MATRIX}"     >> "$GITHUB_OUTPUT"
+          echo "batch_count=${BATCH_COUNT}"        >> "$GITHUB_OUTPUT"
+          echo "effective_resume=${EFFECTIVE_RESUME}" >> "$GITHUB_OUTPUT"
           echo "Total batches: ${BATCH_COUNT}"
 
   # ──────────────────────────────────────────────────────────
@@ -234,21 +324,12 @@ jobs:
         run: |
           echo "key=bignum-bucket-${{ hashFiles('src/BigNum.cpp', 'Makefile') }}" >> "$GITHUB_OUTPUT"
 
-      - name: Restore cached binary
-        id: cache-restore
-        uses: actions/cache@v4
-        with:
-          path: bin/bignum
-          key: ${{ steps.cache-key.outputs.key }}
-
       - name: Install toolchain
-        if: steps.cache-restore.outputs.cache-hit != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y g++ make libboost-dev pkg-config
 
       - name: Build release binary
-        if: steps.cache-restore.outputs.cache-hit != 'true'
         run: make all
 
       - name: Upload binary artifact
@@ -259,12 +340,13 @@ jobs:
           retention-days: 1
 
   # ──────────────────────────────────────────────────────────
-  # Stage 3: Workers – one job per batch (≤ 1000 primes each)
+  # Stage 3: Workers – one job per batch, targeting ~250 workers
   #
   # The batch matrix produced by the plan step drives this job.
-  # Each batch uses LL_RESUME_FROM_EXPONENT + LL_MAX_EXPONENTS_PER_JOB
-  # to select its slice of the bucket prime list without changing
-  # the C++ binary.
+  # With target_workers=250 and max-parallel=256, all workers
+  # start concurrently (up to the GitHub matrix hard cap of 256),
+  # so the entire sweep finishes in roughly the time it takes the
+  # slowest single worker batch.
   # ──────────────────────────────────────────────────────────
   worker:
     needs: [plan, build]
@@ -274,7 +356,7 @@ jobs:
     # For unbounded runs (e.g., large buckets), use a self-hosted runner.
     strategy:
       fail-fast: false
-      max-parallel: 20   # GitHub public free-tier hard limit for concurrent jobs
+      max-parallel: 256   # allow all workers to run concurrently (GitHub matrix hard cap)
       matrix:
         include: ${{ fromJson(needs.plan.outputs.batch_matrix) }}
     steps:
@@ -368,6 +450,40 @@ jobs:
           if [ -d batch_artifacts/ ]; then
             cp -r batch_artifacts/. bucket_out/
           fi
+
+      - name: Extract committed artifacts for already-tested buckets
+        run: |
+          # When auto_resume skips all exponents in the requested range (all
+          # primes already committed in bucket_artifacts/), no worker jobs ran
+          # and no fresh artifacts were downloaded.  Extract the committed zip
+          # archives for the requested bucket range so the merge script finds
+          # real result data rather than an empty set.
+          FRESH=$([ -d batch_artifacts/ ] && find batch_artifacts/ -mindepth 1 -maxdepth 1 -type d | wc -l || echo 0)
+          if [ "${FRESH}" -gt 0 ]; then
+            echo "Fresh batch artifacts present (${FRESH}), skipping committed extraction."
+            exit 0
+          fi
+          START="${{ inputs.bucket_start }}"
+          END="${{ inputs.bucket_end }}"
+          if [ "${START}" -gt "${END}" ]; then
+            echo "No bucket range to extract (start=${START} > end=${END})."
+            exit 0
+          fi
+          mkdir -p bucket_out/
+          EXTRACTED=0
+          for n in $(seq "${START}" "${END}"); do
+            BUCKET_N=$(printf "%02d" "${n}")
+            for zipfile in bucket_artifacts/bucket-${BUCKET_N}-batch-*-results.zip; do
+              [ -f "${zipfile}" ] || continue
+              ARTIFACT_NAME=$(basename "${zipfile}" .zip)
+              DEST="bucket_out/${ARTIFACT_NAME}"
+              mkdir -p "${DEST}"
+              python3 -m zipfile -e "${zipfile}" "${DEST}"
+              echo "Extracted committed artifact: ${zipfile} -> ${DEST}/"
+              EXTRACTED=$(( EXTRACTED + 1 ))
+            done
+          done
+          echo "Extracted ${EXTRACTED} committed artifact(s) for buckets ${START}..${END}."
 
       - name: Install Python (for merge script)
         run: python3 --version  # already available on ubuntu-latest
