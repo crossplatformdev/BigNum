@@ -17,7 +17,17 @@ PLAN_SRC := src/split_bucket_batches.c
 PROF_CXXFLAGS := -std=c++20 -O2 -march=native -pthread -pg -Wall -Wextra
 PROF_LDFLAGS  := -pthread -pg
 
-.PHONY: all clean  unit smoke regression test bench bench-ci prof discover discover-dry-run manual-sweep bucket bucket-dry-run plan-tool
+# Microbenchmark build: -O3 -g -fno-omit-frame-pointer for profiling with
+# frame pointers intact (perf, gprof, valgrind, etc.).
+MICROBENCH_BIN      := bin/microbench_fft
+MICROBENCH_SRC      := bench/microbench_fft.cpp
+MICROBENCH_CXXFLAGS := -std=c++20 -O3 -g -fno-omit-frame-pointer -pthread -Wall -Wextra
+MICROBENCH_LDFLAGS  := -pthread
+# Number of LL iterations for the microbench (0 = full p-2 run, the default).
+# Override at the make command line: make microbench MICROBENCH_ITERS=500
+MICROBENCH_ITERS ?= 0
+
+.PHONY: all clean  unit smoke regression test bench bench-ci prof discover discover-dry-run manual-sweep bucket bucket-dry-run plan-tool microbench
 
 BENCH_START_INDEX ?= 14
 
@@ -124,6 +134,19 @@ prof: $(PROF_BIN)
 
 clean:
 	rm -rf bin prof_report.txt gmon.out discover_out
+
+# ---------------------------------------------------------------------------
+# microbench: FFT Lucas–Lehmer microbenchmark for a single large exponent.
+# Compiled with -O3 -g -fno-omit-frame-pointer for profiling with perf/gprof.
+# Override the number of iterations:
+#   make microbench MICROBENCH_ITERS=500
+# ---------------------------------------------------------------------------
+$(MICROBENCH_BIN): $(MICROBENCH_SRC) $(SRC)
+	@mkdir -p bin
+	$(CXX) $(MICROBENCH_CXXFLAGS) -DMICROBENCH_ITERS=$(MICROBENCH_ITERS) $< -o $@ $(MICROBENCH_LDFLAGS)
+
+microbench: $(MICROBENCH_BIN)
+	./$(MICROBENCH_BIN)
 
 # discover: run full discover mode (set env vars to control behaviour).
 # Example: LL_MAX_EXPONENT=136279950 LL_STOP_AFTER_N_CASES=1 make discover
