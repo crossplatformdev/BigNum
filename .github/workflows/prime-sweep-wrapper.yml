@@ -34,9 +34,9 @@ on:
         type: choice
         default: "Full"
         options:
-          - "Full"
-          - "Upper Half"
-          - "Lower Half"
+          - "full"
+          - "upper_half"
+          - "lower_half"
       bucket_min:
         description: "Lower bucket start (1-64)"
         required: true
