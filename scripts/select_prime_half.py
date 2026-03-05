@@ -82,13 +82,32 @@ def select_half(matrix: list, half: str) -> list:
                 result.append(b)
             else:
                 # Partial batch: test only 'take' primes from batch_min_exponent.
-                # batch_max_exponent is not updated because the binary limits
-                # the run via LL_MAX_EXPONENTS_PER_JOB (= batch_size), not by
-                # comparing exponents against batch_max_exponent.
                 # Note: dict(b) is a safe full copy here because all batch
                 # descriptor values are primitives (int/str).
                 partial = dict(b)
                 partial["batch_size"] = take
+
+                # Keep the batch metadata self-consistent with the trimmed size.
+                # The lower-half partial batch always starts at the original
+                # batch_prime_start_index and takes the first 'take' primes.
+                try:
+                    start_idx = b["batch_prime_start_index"]
+                    end_idx = start_idx + take - 1
+                    bucket_primes = enumerate_bucket_primes(b["bucket_n"])
+                    partial["batch_prime_end_index"] = end_idx
+                    partial["batch_max_exponent"] = bucket_primes[end_idx]
+                except (KeyError, IndexError):
+                    # If any of the expected keys are missing or indices are
+                    # out of range, leave the original metadata unchanged.
+                    pass
+
+                # If a worker_name is present, annotate it to reflect that this
+                # entry covers only a partial lower batch.
+                if "worker_name" in partial:
+                    original_name = str(partial["worker_name"])
+                    partial["worker_name"] = (
+                        f"{original_name} (partial lower {take}/{b['batch_size']})"
+                    )
                 result.append(partial)
             seen += take
         return result
