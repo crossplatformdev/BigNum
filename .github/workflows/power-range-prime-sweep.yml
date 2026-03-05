@@ -261,12 +261,31 @@ jobs:
             echo "::error::target_workers must be a non-negative integer, got '${TARGET_WORKERS}'."
             exit 1
           fi
+
+          CHUNK_INDEX="${{ inputs.chunk_index }}"
+          if ! [[ "${CHUNK_INDEX}" =~ ^[0-9]+$ ]]; then
+            echo "::error::chunk_index must be a non-negative integer, got '${CHUNK_INDEX}'."
+            exit 1
+          fi
+
+          CHUNK_SIZE="${{ inputs.chunk_size }}"
+          if ! [[ "${CHUNK_SIZE}" =~ ^[0-9]+$ ]] || (( CHUNK_SIZE < 1 || CHUNK_SIZE > 256 )); then
+            echo "::error::chunk_size must be an integer in [1, 256], got '${CHUNK_SIZE}'."
+            exit 1
+          fi
+
           echo "Bucket range validated: ${START}..${END}"
           echo "time_limit_minutes validated: ${TIME_LIMIT}"
           echo "target_workers validated: ${TARGET_WORKERS}"
+          echo "chunk_index validated: ${CHUNK_INDEX}, chunk_size validated: ${CHUNK_SIZE}"
 
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Compile plan tool
+        run: |
+          mkdir -p bin
+          gcc -std=c11 -O2 -o bin/split_bucket_batches src/split_bucket_batches.c -lm
 
       - name: Auto-detect last tested exponent
         id: auto-resume
@@ -320,11 +339,11 @@ jobs:
           )
 
           # Print human-readable plan (always useful for audit).
-          python3 scripts/plan_bucket_sweep.py "${PLANNER_FLAGS[@]}" --dry-run
+          bin/split_bucket_batches "${PLANNER_FLAGS[@]}" --dry-run
 
           # Generate the JSON matrix for this chunk (no 256-entry limit error;
           # the planner handles chunking transparently).
-          BATCH_MATRIX=$(python3 scripts/plan_bucket_sweep.py "${PLANNER_FLAGS[@]}")
+          BATCH_MATRIX=$(bin/split_bucket_batches "${PLANNER_FLAGS[@]}")
 
           BATCH_COUNT=$(echo "${BATCH_MATRIX}" | python3 -c "import json,sys; print(len(json.loads(sys.stdin.read())))")
 

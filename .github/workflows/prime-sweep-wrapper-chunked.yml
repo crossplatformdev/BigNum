@@ -5,8 +5,8 @@ name: Prime Sweep Wrapper (Auto-Chunked)
 # Actions matrix hard limit).
 #
 # How it works:
-#   1. count_chunks job: runs the Python planner in count_chunks mode to
-#      determine how many chunks are needed for the requested sweep
+#   1. count_chunks job: compiles the C plan tool, runs it in count_chunks
+#      mode to determine how many chunks are needed for the requested sweep
 #      parameters.
 #   2. sweep_chunk job (matrix): spawns one copy of power-range-prime-sweep.yml
 #      for each chunk.  Each spawned run executes at most 256 parallel workers.
@@ -125,6 +125,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Compile plan tool
+        run: |
+          mkdir -p bin
+          gcc -std=c11 -O2 -o bin/split_bucket_batches src/split_bucket_batches.c -lm
+
       - name: Auto-detect last tested exponent
         id: auto-resume
         run: |
@@ -146,8 +151,8 @@ jobs:
           fi
           echo "Effective resume exponent: ${EFFECTIVE_RESUME}"
 
-          CHUNK_INFO=$(python3 scripts/plan_bucket_sweep.py \
-            --mode           count_chunks \
+          CHUNK_INFO=$(bin/split_bucket_batches \
+            --count-chunks \
             --bucket-start   "${{ inputs.bucket_min }}" \
             --bucket-end     "${{ inputs.bucket_top }}" \
             --target-workers "${{ inputs.target_workers }}" \
@@ -161,7 +166,7 @@ jobs:
           TOTAL_BATCHES=$(echo "${CHUNK_INFO}" | python3 -c "import json,sys; print(json.loads(sys.stdin.read())['total_batches'])")
           CHUNK_COUNT=$(echo "${CHUNK_INFO}"   | python3 -c "import json,sys; print(json.loads(sys.stdin.read())['chunk_count'])")
 
-          # Build the chunk matrix: [{"chunk_index": 0}, {"chunk_index": 1}, ...]
+          # Build the chunk matrix: [{"chunk_index": "0"}, {"chunk_index": "1"}, ...]
           CHUNK_MATRIX=$(python3 -c "
 import json, sys
 n = int('${CHUNK_COUNT}')
