@@ -503,15 +503,24 @@ jobs:
       - name: Write workflow step summary
         if: always()
         run: |
-          echo "## Power Bucket Prime Sweep – Final Summary" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "**Workflow run:** ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          if [ -f bucket_out/merged_summary.md ]; then
-            cat bucket_out/merged_summary.md >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "_(no merged summary produced)_" >> "$GITHUB_STEP_SUMMARY"
-          fi
+          {
+            echo "## Power Bucket Prime Sweep – Final Summary"
+            echo ""
+            echo "**Workflow run:** ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo ""
+            if [ -f bucket_out/merged_summary.md ]; then
+              # Omit the composite-exponents table: it can exceed GitHub's 1 MB
+              # step-summary limit.  The full report is in the bucket-sweep-merged-results artifact.
+              awk '/^## Composite Exponents Tested/{
+                print
+                print ""
+                print "_Full composite table omitted – see the `bucket-sweep-merged-results` artifact for the complete report._"
+                exit
+              } {print}' bucket_out/merged_summary.md
+            else
+              echo "_(no merged summary produced)_"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Emit discovery notice
         if: steps.merge.outputs.new_discovery == 'true'
@@ -530,3 +539,4 @@ jobs:
             bucket_out/merged_new_discoveries.json
           retention-days: 90
           if-no-files-found: warn
+          compression-level: 9
