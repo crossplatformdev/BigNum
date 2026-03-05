@@ -109,6 +109,21 @@ jobs:
           name: bucket-sweep-merged-results
           path: merged_results/
 
+      - name: Zip report with max compression
+        run: |
+          if [ -f merged_results/merged_summary.md ]; then
+            zip -9 merged_summary_report.zip merged_results/merged_summary.md
+          fi
+
+      - name: Upload compressed report
+        if: hashFiles('merged_summary_report.zip') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: prime-sweep-report
+          path: merged_summary_report.zip
+          retention-days: 90
+          compression-level: 9
+
       - name: Present sweep report
         run: |
           {
@@ -118,7 +133,14 @@ jobs:
             echo "**Workflow run:** ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
             echo ""
             if [ -f merged_results/merged_summary.md ]; then
-              cat merged_results/merged_summary.md
+              # Omit the composite-exponents table: it can exceed GitHub's 1 MB
+              # step-summary limit.  The full report is in the prime-sweep-report artifact.
+              awk '/^## Composite Exponents Tested/{
+                print
+                print ""
+                print "_Full composite table omitted – download the `prime-sweep-report` artifact for the complete report._"
+                exit
+              } {print}' merged_results/merged_summary.md
             else
               echo "_(merged summary not available – the sweep may have produced no results)_"
             fi
