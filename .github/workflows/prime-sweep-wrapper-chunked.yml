@@ -260,8 +260,12 @@ print(json.dumps([{'chunk_index': str(i)} for i in range(n)]))")
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Emit discovery notice
-        if: needs.sweep_chunk.outputs.new_discovery == 'true'
+        if: success() || failure()
         run: |
-          echo "::notice title=NEW MERSENNE PRIME FOUND::Check the bucket-sweep-merged-results artifacts for details!"
-          echo "## 🚨 NEW MERSENNE PRIME FOUND" >> "$GITHUB_STEP_SUMMARY"
-          echo "Check the **bucket-sweep-merged-results** artifacts from each chunk for details." >> "$GITHUB_STEP_SUMMARY"
+          # Detect discoveries by scanning merged artifacts across all chunks,
+          # instead of relying on matrix job outputs (which are not aggregated).
+          if find all_results -type f -name 'merged_new_discoveries.json' -print -quit | grep -q .; then
+            echo "::notice title=NEW MERSENNE PRIME FOUND::Check the bucket-sweep-merged-results artifacts for details!"
+            echo "## 🚨 NEW MERSENNE PRIME FOUND" >> "$GITHUB_STEP_SUMMARY"
+            echo "Check the **bucket-sweep-merged-results** artifacts from each chunk for details." >> "$GITHUB_STEP_SUMMARY"
+          fi
