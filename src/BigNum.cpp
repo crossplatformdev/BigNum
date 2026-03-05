@@ -40,7 +40,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <barrier>
 #include <cassert>
 #include <chrono>
 #include <cmath>
@@ -1101,20 +1100,18 @@ struct FftTeam {
             BATCH_EARLY,   // all early butterfly stages within each thread's chunk
             DWT_PACK,      // Step 1:  hr[k]=wfi[2k]*d[2k]
             POST_SQ_PRE,   // Step 3 inner loop: k=1..M/2
-            DWT_UNPACK,    // Step 5:  d[2k]=hr[k]*wih[2k]
-            HI_CORR,       // Step 6:  half-integer correction (boundary deferred)
-            CARRY_PASS1    // Step 7 pass 1: carry with speculative carry_in=0
+            DWT_UNPACK     // Step 5:  d[2k]=hr[k]*wih[2k]
         };
         Kind          kind{Kind::BIT_REVERSAL};
         double*       re{nullptr};    // hbuf_re / digits
-        double*       im{nullptr};    // hbuf_im / max_err_buf (CARRY_PASS1)
+        double*       im{nullptr};    // hbuf_im
         const size_t* bitrv{nullptr}; // bit-reversal table
-        const double* tw_re{nullptr}; // twiddles / mod_pow / w_fwd_inv / w_inv_half
-        const double* tw_im{nullptr}; // twiddles / inv_mod_pow
-        double*       aux{nullptr};   // carry_out_buf / boundary_delta / digits
+        const double* tw_re{nullptr}; // twiddles / w_fwd_inv / w_inv_half
+        const double* tw_im{nullptr}; // twiddles
+        double*       aux{nullptr};   // digits (DWT_PACK/UNPACK)
         size_t n{0};     // array length
         size_t len{0};   // butterfly len or BATCH_EARLY len_max
-        size_t step{0};  // butterfly step or chunk_size
+        size_t step{0};  // butterfly step
     };
 
     unsigned nthreads{0};
@@ -1341,67 +1338,6 @@ private:
                 d[2u * k]      = p.re[k] * wih[2u * k];
                 d[2u * k + 1u] = p.im[k] * wih[2u * k + 1u];
             }
-            break;
-        }
-
-        // Step 6: half-integer correction.
-        // Each thread processes k ∈ [lo+1, hi) — the first k of each chunk
-        // (k=lo) might write to digits[lo-1] which belongs to another thread,
-        // so it is stored in aux[tid] for sequential application by main.
-        // re=digits, tw_re=mod_pow, aux=boundary_delta[T], n=n_full, step=chunk
-        case WorkPhase::Kind::HI_CORR: {
-            const size_t chunk = p.step;
-            const size_t lo    = static_cast<size_t>(tid) * chunk;
-            const size_t hi    = std::min(lo + chunk, p.n);
-            const double* mp   = p.tw_re;
-            double* d          = p.re;
-
-            // Boundary k=lo: defer cross-chunk write.
-            p.aux[tid] = 0.0;
-            if (lo < p.n) {
-                const double v    = d[lo];
-                const double frac = v - std::floor(v);
-                if (std::abs(frac - 0.5) < 0.25) {
-                    d[lo] = std::floor(v);
-                    const size_t kp = (lo == 0u) ? (p.n - 1u) : (lo - 1u);
-                    p.aux[tid] = 0.5 * mp[kp];   // deferred add to d[kp]
-                }
-            }
-            // Inner k=lo+1..hi-1: both d[k] and d[k-1] are in own range.
-            for (size_t k = lo + 1u; k < hi; ++k) {
-                const double v    = d[k];
-                const double frac = v - std::floor(v);
-                if (std::abs(frac - 0.5) < 0.25) {
-                    d[k]     = std::floor(v);
-                    d[k - 1u] += 0.5 * mp[k - 1u];
-                }
-            }
-            break;
-        }
-
-        // Step 7 pass 1: carry propagation with speculative carry_in = 0.
-        // Stores outgoing carry in aux[tid] and max rounding error in im[tid].
-        // re=digits, im=max_err_buf[T], tw_re=mod_pow, tw_im=inv_mod_pow,
-        // aux=carry_out_buf[T], n=n_full, step=chunk_size
-        case WorkPhase::Kind::CARRY_PASS1: {
-            const size_t chunk = p.step;
-            const size_t lo    = static_cast<size_t>(tid) * chunk;
-            const size_t hi    = std::min(lo + chunk, p.n);
-            const double* mp   = p.tw_re;
-            const double* imp  = p.tw_im;
-            double* d          = p.re;
-            double carry = 0.0;
-            double maxe  = 0.0;
-            for (size_t j = lo; j < hi; ++j) {
-                const double raw     = d[j] + carry;
-                const double rounded = std::nearbyint(raw);
-                const double err     = std::abs(raw - rounded);
-                if (err > maxe) maxe = err;
-                carry = std::floor(rounded * imp[j]);
-                d[j]  = rounded - carry * mp[j];
-            }
-            p.aux[tid] = carry;   // outgoing carry (with carry_in=0)
-            p.im [tid] = maxe;    // max rounding error for this chunk
             break;
         }
 
@@ -1765,13 +1701,6 @@ static void fft_square(FftMersenneState& st) {
     const double* twi = st.tw_im.data();
     FftTeam* team = st.team.get();
 
-    // Small per-call scratch arrays (T ≤ 8) for boundary/carry data.
-    // These live on the stack and are valid for the duration of each dispatch.
-    const unsigned T = team ? (team->nthreads + 1u) : 1u;
-    double boundary_delta[8] = {};   // HI_CORR deferred cross-chunk write
-    double carry_out_buf[8]  = {};   // CARRY_PASS1 outgoing carry per chunk
-    double carry_err_buf[8]  = {};   // CARRY_PASS1 max rounding error per chunk
-
     // ---- Step 1: DWT + pack ----
     if (team) {
         FftTeam::WorkPhase p;
@@ -1805,7 +1734,7 @@ static void fft_square(FftMersenneState& st) {
         hr[0] = (y0 + ym) * 0.5;
         hi[0] = (y0 - ym) * 0.5;
     }
-    // k=1..M/2: parallel.
+    // k=1..M/2: parallel when team available.
     if (team) {
         FftTeam::WorkPhase p;
         p.kind  = FftTeam::WorkPhase::Kind::POST_SQ_PRE;
@@ -1874,41 +1803,13 @@ static void fft_square(FftMersenneState& st) {
         }
     }
 
-    // ---- Step 6: Half-integer correction ----
-    if (team) {
-        // k=0 must run on main BEFORE the parallel dispatch: it writes to
-        // d[n-1], which Thread T-1 reads in the parallel phase.  In the serial
-        // algorithm k=0 runs first, so we preserve that ordering here.
-        {
-            double* d = st.digits.data();
-            const double v    = d[0];
-            const double frac = v - std::floor(v);
-            if (std::abs(frac - 0.5) < 0.25) {
-                d[0]     = std::floor(v);
-                d[n - 1u] += 0.5 * st.mod_pow[n - 1u];
-            }
-        }
-
-        const size_t chunk = (n + T - 1u) / T;
-        FftTeam::WorkPhase p;
-        p.kind  = FftTeam::WorkPhase::Kind::HI_CORR;
-        p.re    = st.digits.data();
-        p.tw_re = st.mod_pow.data();
-        p.aux   = boundary_delta;
-        p.n     = n;  p.step = chunk;
-        team->dispatch(p);
-        // Apply deferred cross-chunk corrections (all for lo > 0).
-        double* d = st.digits.data();
-        for (unsigned t = 0u; t < T; ++t) {
-            if (boundary_delta[t] != 0.0) {
-                const size_t lo = static_cast<size_t>(t) * chunk;
-                // lo==0: k=0 was handled above; boundary_delta[0] will be 0.
-                // lo>0:  kp = lo-1 (no wrap-around needed).
-                const size_t kp = (lo == 0u) ? (n - 1u) : (lo - 1u);
-                d[kp] += boundary_delta[t];
-            }
-        }
-    } else {
+    // ---- Step 6: Half-integer correction (serial) ----
+    // Sequential by design: correction at k writes to d[k-1], which was
+    // already read in the previous iteration.  The carry propagation in
+    // Step 7 also has strict left-to-right data dependencies.  Both steps
+    // are O(n) and are dominated by the O(n log n) FFT (Steps 2 and 4),
+    // so running them serially does not materially affect overall throughput.
+    {
         double* d = st.digits.data();
         for (size_t k = 0; k < n; ++k) {
             const double v    = d[k];
@@ -1921,92 +1822,9 @@ static void fft_square(FftMersenneState& st) {
         }
     }
 
-    // ---- Step 7: Carry propagation ----
-    //
-    // Parallel two-pass algorithm with pre-carry save-and-restore:
-    //   Save:   snapshot first SAVE_LEN digits of each chunk t>0.
-    //   Pass 1: each thread processes its chunk with carry_in=0 (speculative).
-    //   Fix-up: for each chunk t where actual carry_in ≠ 0 (comes from
-    //           carry_out_buf[t-1]), restore the snapshot and re-process the
-    //           first SAVE_LEN elements with the correct carry.  Carries are
-    //           bounded in {-1,0,1} and die within a few positions for any
-    //           b_hi ≥ 2, so SAVE_LEN=64 is a safe upper bound.
+    // ---- Step 7: Carry propagation (serial) ----
     double max_err = 0.0;
-
-    if (team) {
-        constexpr size_t SAVE_LEN = 64u;
-        const size_t chunk = (n + T - 1u) / T;
-
-        // Save original (pre-carry) values for the leading SAVE_LEN elements
-        // of each chunk t > 0 so we can restore and redo with the correct carry.
-        double pre_carry_save[7u * SAVE_LEN] = {};  // T≤8 → at most 7 chunks to save
-        for (unsigned t = 1u; t < T; ++t) {
-            const size_t lo  = static_cast<size_t>(t) * chunk;
-            if (lo >= n) break;
-            const size_t cnt = std::min(SAVE_LEN, n - lo);
-            std::memcpy(pre_carry_save + static_cast<size_t>(t - 1u) * SAVE_LEN,
-                        st.digits.data() + lo, cnt * sizeof(double));
-        }
-
-        // Pass 1: parallel carry, speculative carry_in=0 for all chunks.
-        {
-            FftTeam::WorkPhase p;
-            p.kind  = FftTeam::WorkPhase::Kind::CARRY_PASS1;
-            p.re    = st.digits.data();
-            p.im    = carry_err_buf;
-            p.tw_re = st.mod_pow.data();
-            p.tw_im = st.inv_mod_pow.data();
-            p.aux   = carry_out_buf;
-            p.n     = n;  p.step = chunk;
-            team->dispatch(p);
-        }
-        for (unsigned t = 0u; t < T; ++t)
-            if (carry_err_buf[t] > max_err) max_err = carry_err_buf[t];
-
-        // Sequential inter-chunk carry fix-up.
-        const double* mp  = st.mod_pow.data();
-        const double* imp = st.inv_mod_pow.data();
-        double* d = st.digits.data();
-
-        double actual_carry_in = 0.0;   // chunk 0 always starts with 0
-        for (unsigned t = 0u; t < T; ++t) {
-            if (actual_carry_in != 0.0 && t > 0u) {
-                // Restore pre-carry snapshot for the leading SAVE_LEN elements.
-                const size_t lo  = static_cast<size_t>(t) * chunk;
-                const size_t cnt = std::min(SAVE_LEN, n - lo);
-                std::memcpy(d + lo,
-                            pre_carry_save + static_cast<size_t>(t - 1u) * SAVE_LEN,
-                            cnt * sizeof(double));
-                // Re-process with correct carry_in until carry dies (early-exit).
-                double c = actual_carry_in;
-                for (size_t j = lo, jhi = lo + cnt; j < jhi; ++j) {
-                    if (c == 0.0) break;
-                    const double raw     = d[j] + c;
-                    const double rounded = std::nearbyint(raw);
-                    const double err     = std::abs(raw - rounded);
-                    if (err > max_err) max_err = err;
-                    c   = std::floor(rounded * imp[j]);
-                    d[j] = rounded - c * mp[j];
-                }
-                carry_out_buf[t] = c;   // 0 in practice (carry died within SAVE_LEN)
-            }
-            actual_carry_in = carry_out_buf[t];
-        }
-
-        // Wrap-around: residual carry after all chunks.
-        if (actual_carry_in != 0.0) {
-            double carry2 = actual_carry_in;
-            for (size_t j = 0; j < n && carry2 != 0.0; ++j) {
-                const double raw_j     = d[j] + carry2;
-                const double rounded_j = std::nearbyint(raw_j);
-                const double err_j     = std::abs(raw_j - rounded_j);
-                if (err_j > max_err) max_err = err_j;
-                carry2 = std::floor(rounded_j * imp[j]);
-                d[j]   = rounded_j - carry2 * mp[j];
-            }
-        }
-    } else {
-        // Single-threaded carry (unchanged).
+    {
         const double* mp  = st.mod_pow.data();
         const double* imp = st.inv_mod_pow.data();
         double*       d   = st.digits.data();
@@ -2019,6 +1837,7 @@ static void fft_square(FftMersenneState& st) {
             carry = std::floor(rounded * imp[j]);
             d[j]  = rounded - carry * mp[j];
         }
+        // Wrap-around: carry * 2^p ≡ carry (mod M_p).
         if (carry != 0.0) {
             double carry2 = carry;
             for (size_t j = 0; j < n && carry2 != 0.0; ++j) {
