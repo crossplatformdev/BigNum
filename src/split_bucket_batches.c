@@ -10,6 +10,9 @@
  *                        [--time-limit-seconds S]
  *                        [--resume-from-exponent N]
  *                        [--target-workers N]
+ *                        [--prime-half {full|lower_half|upper_half}]
+ *                        [--chunk-index N]  [--chunk-size N]
+ *                        [--count-chunks]
  *                        [--dry-run]
  *                        [--output FILE] [--count-only]
  *
@@ -37,6 +40,29 @@
  *   omitted entirely; the first remaining batch starts from the next
  *   untested prime.  Batch ordinal numbers are still reported relative to
  *   the full bucket prime list so worker names remain stable across resumes.
+ *
+ * --prime-half {full|lower_half|upper_half}
+ *   Filter the batch matrix to cover only the specified half of all prime
+ *   exponents (ordered ascending by value).  Applied before chunking so
+ *   worker ordinals remain stable when the same sweep is split across runs.
+ *   lower_half – first floor(total/2) primes; last batch may be trimmed.
+ *   upper_half – last ceil(total/2) primes; first batch may be trimmed
+ *                (batch_min_exponent is advanced to the correct value).
+ *   full (default) – include all primes.
+ *
+ * --count-chunks
+ *   Instead of emitting a JSON batch matrix, print a single JSON object:
+ *     {"total_batches":<N>,"chunk_size":<K>,"chunk_count":<C>}
+ *   where N is the total filtered batch count, K is the --chunk-size value
+ *   (default 256), and C = ceil(N/K).  Useful for workflow orchestration.
+ *
+ * --chunk-index N  (default 0)
+ *   Emit only batch entries in the Nth chunk (0-based).  The output is a
+ *   slice of the full filtered matrix: entries [N*chunk_size, (N+1)*chunk_size).
+ *
+ * --chunk-size K  (default 256, max 256)
+ *   Number of batches per chunk / GitHub Actions matrix limit.
+ *   When --chunk-index / --count-chunks is used, this controls the slice size.
  *
  * Worker name format:
  *   bucket-{N:02d}-batch-{start_ordinal:04d}-{end_ordinal:04d}-exp-{pmin}-{pmax}
@@ -293,14 +319,16 @@ static BatchVec split_bucket_into_batches(int n, size_t batch_size,
 }
 
 /* =========================================================================
- * Print the batch matrix as a compact JSON array.
+ * Print a slice [slice_start, slice_end) of the batch matrix as JSON.
  * ========================================================================= */
-static void print_json_matrix(FILE *out, const BatchVec *m)
+static void print_json_matrix_slice(FILE *out, const BatchVec *m,
+                                    size_t slice_start, size_t slice_end)
 {
+    if (slice_end > m->size) slice_end = m->size;
     fputc('[', out);
-    for (size_t i = 0; i < m->size; i++) {
+    for (size_t i = slice_start; i < slice_end; i++) {
         const Batch *b = &m->data[i];
-        if (i > 0) fputc(',', out);
+        if (i > slice_start) fputc(',', out);
         fprintf(out,
                 "{\"bucket_n\":%d"
                 ",\"bucket_min\":%" PRIu64
@@ -322,6 +350,133 @@ static void print_json_matrix(FILE *out, const BatchVec *m)
                 b->worker_name);
     }
     fputs("]\n", out);
+}
+
+/* =========================================================================
+ * Filter the batch matrix to the lower or upper half of all prime exponents
+ * (ordered ascending by value).  Applied before chunking so worker ordinals
+ * remain stable when the same sweep is split across multiple runs.
+ *
+ * prime_half: 0 = full (no-op), 1 = lower_half, 2 = upper_half
+ *
+ * Half definition:
+ *   total = sum of batch_size across all batches
+ *   mid   = total / 2  (integer, rounds down)
+ *   lower = first mid primes (indices 0 .. mid-1, ascending by value)
+ *   upper = last (total-mid) primes (indices mid .. total-1)
+ *
+ * Partial-batch handling:
+ *   lower – the last batch crossing the boundary is trimmed: batch_size and
+ *           batch_max_exponent are reduced to include only the first 'take'
+ *           primes.
+ *   upper – the first batch crossing the boundary is trimmed: batch_size is
+ *           reduced and batch_min_exponent / batch_prime_start_index are
+ *           advanced to the correct prime value.
+ * ========================================================================= */
+static BatchVec apply_prime_half(const BatchVec *m, int prime_half)
+{
+    BatchVec result = {NULL, 0, 0};
+
+    if (prime_half == 0) {
+        for (size_t i = 0; i < m->size; i++)
+            batch_push(&result, &m->data[i]);
+        return result;
+    }
+
+    /* Count total primes across all batches. */
+    size_t total = 0;
+    for (size_t i = 0; i < m->size; i++)
+        total += m->data[i].batch_size;
+
+    if (total == 0)
+        return result;
+
+    size_t mid = total / 2;  /* lower half: [0, mid); upper half: [mid, total) */
+
+    if (prime_half == 1) {   /* lower_half */
+        if (mid == 0)
+            return result;
+
+        size_t seen = 0;
+        for (size_t i = 0; i < m->size; i++) {
+            if (seen >= mid) break;
+            const Batch *b = &m->data[i];
+            size_t take = b->batch_size;
+            if (seen + take > mid)
+                take = mid - seen;
+
+            if (take == b->batch_size) {
+                batch_push(&result, b);
+            } else {
+                /* Partial batch: trim to 'take' primes from the start. */
+                Batch partial = *b;
+                partial.batch_size = take;
+                size_t end_idx = b->batch_prime_start_index + take - 1;
+                partial.batch_prime_end_index = end_idx;
+                /* Look up the prime value at the trimmed end. */
+                U64Vec primes = enumerate_bucket_primes(b->bucket_n);
+                if (end_idx < primes.size)
+                    partial.batch_max_exponent = primes.data[end_idx];
+                free(primes.data);
+                /* Regenerate worker_name to reflect the trimmed end ordinal/exponent. */
+                snprintf(partial.worker_name, WORKER_NAME_MAX,
+                         "bucket-%02d-batch-%04zu-%04zu-exp-%" PRIu64 "-%" PRIu64,
+                         partial.bucket_n,
+                         partial.batch_prime_start_index + 1,
+                         end_idx + 1,
+                         partial.batch_min_exponent,
+                         partial.batch_max_exponent);
+                batch_push(&result, &partial);
+            }
+            seen += take;
+        }
+
+    } else {   /* upper_half */
+        size_t upper_count = total - mid;
+        if (upper_count == 0)
+            return result;
+
+        size_t seen = 0;
+        for (size_t i = 0; i < m->size; i++) {
+            const Batch *b = &m->data[i];
+            size_t batch_end = seen + b->batch_size;
+
+            if (batch_end <= mid) {
+                /* Entire batch is in the lower half – skip it. */
+                seen = batch_end;
+                continue;
+            }
+
+            if (seen < mid) {
+                /* Straddling batch: skip the first (mid - seen) primes. */
+                size_t skip_in_batch = mid - seen;
+                Batch partial = *b;
+                size_t new_start_idx = b->batch_prime_start_index + skip_in_batch;
+                partial.batch_prime_start_index = new_start_idx;
+                partial.batch_size = b->batch_size - skip_in_batch;
+                /* Look up the prime value at the new start position. */
+                U64Vec primes = enumerate_bucket_primes(b->bucket_n);
+                if (new_start_idx < primes.size)
+                    partial.batch_min_exponent = primes.data[new_start_idx];
+                free(primes.data);
+                /* Regenerate worker_name to reflect the advanced start ordinal/exponent. */
+                snprintf(partial.worker_name, WORKER_NAME_MAX,
+                         "bucket-%02d-batch-%04zu-%04zu-exp-%" PRIu64 "-%" PRIu64,
+                         partial.bucket_n,
+                         new_start_idx + 1,
+                         partial.batch_prime_end_index + 1,
+                         partial.batch_min_exponent,
+                         partial.batch_max_exponent);
+                batch_push(&result, &partial);
+            } else {
+                batch_push(&result, b);
+            }
+
+            seen = batch_end;
+        }
+    }
+
+    return result;
 }
 
 /* =========================================================================
@@ -396,6 +551,11 @@ int main(int argc, char **argv)
     double      time_limit_sec   = 0.0;   /* 0 = use --batch-size only */
     uint64_t    resume_from      = 0;     /* 0 = no skip               */
     size_t      target_workers   = 0;     /* 0 = off                   */
+    int         prime_half       = 0;     /* 0=full, 1=lower_half, 2=upper_half */
+    size_t      chunk_index      = 0;     /* 0-based chunk index       */
+    size_t      chunk_sz         = GITHUB_MATRIX_MAX; /* max batches per chunk */
+    int         count_chunks_mode = 0;    /* --count-chunks flag        */
+    int         chunking_enabled = 0;     /* true when chunk flags used */
     int         dry_run          = 0;
     int         count_only       = 0;
     const char *output_file      = NULL;
@@ -413,6 +573,36 @@ int main(int argc, char **argv)
             resume_from    = parse_nonneg_uint64("--resume-from-exponent", argv[++i]);
         else if (!strcmp(argv[i], "--target-workers")      && i + 1 < argc)
             target_workers = parse_nonneg_int("--target-workers", argv[++i]);
+        else if (!strcmp(argv[i], "--prime-half")          && i + 1 < argc) {
+            const char *val = argv[++i];
+            if      (!strcmp(val, "lower_half")) prime_half = 1;
+            else if (!strcmp(val, "upper_half")) prime_half = 2;
+            else if (!strcmp(val, "full"))       prime_half = 0;
+            else {
+                fprintf(stderr,
+                        "ERROR: --prime-half must be full/lower_half/upper_half,"
+                        " got '%s'\n", val);
+                return 1;
+            }
+        }
+        else if (!strcmp(argv[i], "--chunk-index")         && i + 1 < argc) {
+            chunk_index      = parse_nonneg_int("--chunk-index", argv[++i]);
+            chunking_enabled = 1;
+        }
+        else if (!strcmp(argv[i], "--chunk-size")          && i + 1 < argc) {
+            chunk_sz = parse_positive_int("--chunk-size", argv[++i]);
+            if (chunk_sz > GITHUB_MATRIX_MAX) {
+                fprintf(stderr,
+                        "ERROR: --chunk-size must be in [1, %d], got %zu\n",
+                        GITHUB_MATRIX_MAX, chunk_sz);
+                return 1;
+            }
+            chunking_enabled = 1;
+        }
+        else if (!strcmp(argv[i], "--count-chunks")) {
+            count_chunks_mode = 1;
+            chunking_enabled  = 1;
+        }
         else if (!strcmp(argv[i], "--dry-run"))
             dry_run        = 1;
         else if (!strcmp(argv[i], "--count-only"))
@@ -488,14 +678,27 @@ int main(int argc, char **argv)
         free(bv.data);
     }
 
-    /* --count-only */
+    /* ── Step 4: apply prime-half filter ──────────────────────────────── */
+    BatchVec filtered = apply_prime_half(&matrix, prime_half);
+    free(matrix.data);
+
+    /* --count-only: print filtered batch count and exit. */
     if (count_only) {
-        printf("%zu\n", matrix.size);
-        free(matrix.data);
+        printf("%zu\n", filtered.size);
+        free(filtered.data);
         return 0;
     }
 
-    /* --dry-run */
+    /* --count-chunks: print JSON summary and exit. */
+    if (count_chunks_mode) {
+        size_t num_chunks = (filtered.size + chunk_sz - 1) / chunk_sz;
+        printf("{\"total_batches\":%zu,\"chunk_size\":%zu,\"chunk_count\":%zu}\n",
+               filtered.size, chunk_sz, num_chunks);
+        free(filtered.data);
+        return 0;
+    }
+
+    /* --dry-run: human-readable plan showing all filtered batches. */
     if (dry_run) {
         printf("bucket_start         : %d\n", bucket_start);
         printf("bucket_end           : %d\n", bucket_end);
@@ -509,14 +712,21 @@ int main(int argc, char **argv)
         } else {
             printf("batch_size           : %zu\n", batch_size);
         }
+        if (prime_half == 1)      printf("prime_half           : lower_half\n");
+        else if (prime_half == 2) printf("prime_half           : upper_half\n");
         if (resume_from > 0)
             printf("resume_from_exponent : %" PRIu64
                    "  (skipping exponents <= %" PRIu64 ")\n",
                    resume_from, resume_from);
-        printf("total batches        : %zu\n", matrix.size);
+        printf("total batches        : %zu\n", filtered.size);
+        if (chunking_enabled) {
+            size_t num_chunks = (filtered.size + chunk_sz - 1) / chunk_sz;
+            printf("chunk_size           : %zu\n", chunk_sz);
+            printf("chunk_count          : %zu\n", num_chunks);
+        }
         printf("\n");
-        for (size_t i = 0; i < matrix.size; i++) {
-            const Batch *b = &matrix.data[i];
+        for (size_t i = 0; i < filtered.size; i++) {
+            const Batch *b = &filtered.data[i];
             if (time_limit_sec > 0.0) {
                 double w = worst_sec_for_bucket(b->bucket_n);
                 printf("  [%3zu/%3zu]  bucket=%2d"
@@ -543,41 +753,57 @@ int main(int argc, char **argv)
                        b->worker_name);
             }
         }
-        if (matrix.size > GITHUB_MATRIX_MAX) {
+        if (!chunking_enabled && filtered.size > GITHUB_MATRIX_MAX) {
             fprintf(stderr,
                     "\nWARNING: %zu batches exceeds the GitHub Actions matrix"
-                    " limit of %d.  Narrow the bucket range or increase"
-                    " --batch-size.\n",
-                    matrix.size, GITHUB_MATRIX_MAX);
+                    " limit of %d.  Use --chunk-size / --chunk-index or narrow"
+                    " the bucket range.\n",
+                    filtered.size, GITHUB_MATRIX_MAX);
         }
-        free(matrix.data);
+        free(filtered.data);
         return 0;
     }
 
-    /* Normal mode: validate matrix size and output JSON. */
-    if (matrix.size > GITHUB_MATRIX_MAX) {
+    /* Normal mode: output the JSON matrix for the requested chunk. */
+    size_t slice_start = chunk_index * chunk_sz;
+    size_t slice_end   = slice_start + chunk_sz;
+    if (slice_end > filtered.size) slice_end = filtered.size;
+
+    /* Guard: without explicit chunking, error if total exceeds the limit. */
+    if (!chunking_enabled && filtered.size > GITHUB_MATRIX_MAX) {
         fprintf(stderr,
                 "ERROR: %zu batches exceeds the GitHub Actions matrix limit"
-                " of %d. Narrow the bucket range or increase --batch-size.\n",
-                matrix.size, GITHUB_MATRIX_MAX);
-        free(matrix.data);
+                " of %d.  Use --count-chunks / --chunk-index / --chunk-size"
+                " or narrow the bucket range.\n",
+                filtered.size, GITHUB_MATRIX_MAX);
+        free(filtered.data);
+        return 1;
+    }
+
+    /* Guard: chunk_index out of range. */
+    if (slice_start >= filtered.size && filtered.size > 0) {
+        fprintf(stderr,
+                "ERROR: --chunk-index %zu is out of range"
+                " (total filtered batches: %zu, chunk_size: %zu)\n",
+                chunk_index, filtered.size, chunk_sz);
+        free(filtered.data);
         return 1;
     }
 
     FILE *out = stdout;
     if (output_file) {
         out = fopen(output_file, "w");
-        if (!out) { perror(output_file); free(matrix.data); return 1; }
+        if (!out) { perror(output_file); free(filtered.data); return 1; }
     }
 
-    print_json_matrix(out, &matrix);
+    print_json_matrix_slice(out, &filtered, slice_start, slice_end);
 
     if (output_file) {
         fclose(out);
         fprintf(stderr, "Wrote %zu batch entries to %s\n",
-                matrix.size, output_file);
+                slice_end - slice_start, output_file);
     }
 
-    free(matrix.data);
+    free(filtered.data);
     return 0;
 }
