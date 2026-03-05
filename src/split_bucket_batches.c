@@ -58,10 +58,17 @@
 
 /* =========================================================================
  * Per-bucket worst-case single-exponent test time (seconds).
- * Source: REPORT_MERSENNE_EXPONENTS-256-65536.MD benchmark run.
- *   Buckets 9-16  – measured "Longest (s)" column.
+ *
+ * Measurement config: 4 LL worker threads, LL_FFT_THREADS=2,
+ * LL_FFT_ALLOW_NESTED=1 (matches the worker job configuration in CI).
+ * Each entry is the time for the largest prime exponent in that bucket
+ * (worst case), measured with `LL_REVERSE_ORDER=1 LL_MAX_EXPONENTS_PER_JOB=1`.
+ *
  *   Buckets 1-10  – sub-millisecond; floored at 0.001 s.
- *   Buckets 17-21 – extrapolated at ×4.5 per bucket.
+ *   Buckets 11-16 – directly measured on the same hardware/config as CI.
+ *   Buckets 17-21 – projected from B16 using the geometric-mean growth
+ *                   factor derived from buckets 12-16: ×4.13 per bucket.
+ *                   (B12→B16 geomean: (5.536/0.019)^{1/4} = 4.1315)
  * ========================================================================= */
 #define BUCKET_WORST_SEC_MAX 21   /* highest index in the table below */
 static const double BUCKET_WORST_SEC[BUCKET_WORST_SEC_MAX + 1] = {
@@ -69,24 +76,23 @@ static const double BUCKET_WORST_SEC[BUCKET_WORST_SEC_MAX + 1] = {
     /* 1  */ 0.001,  /* 2  */ 0.001,  /* 3  */ 0.001,  /* 4  */ 0.001,
     /* 5  */ 0.001,  /* 6  */ 0.001,  /* 7  */ 0.001,  /* 8  */ 0.001,
     /* 9  */ 0.001,  /* 10 */ 0.001,  /* measured: <1 ms            */
-    /* 11 */ 0.005,  /* measured                                     */
-    /* 12 */ 0.027,  /* measured                                     */
-    /* 13 */ 0.093,  /* measured                                     */
-    /* 14 */ 0.325,  /* measured                                     */
-    /* 15 */ 1.283,  /* measured                                     */
-    /* 16 */ 5.646,  /* measured                                     */
-    /* 17 */ 25.407, /* extrapolated: 5.646 × 4.5                   */
-    /* 18 */ 114.332,/* extrapolated: 25.407 × 4.5                  */
-    /* 19 */ 514.492,/* extrapolated: 114.332 × 4.5                 */
-    /* 20 */ 2315.213,/* extrapolated: 514.492 × 4.5                */
-    /* 21 */ 10418.458,/* extrapolated: 2315.213 × 4.5              */
+    /* 11 */ 0.003,  /* measured: M_2039                             */
+    /* 12 */ 0.019,  /* measured: M_4093                             */
+    /* 13 */ 0.078,  /* measured: M_8191                             */
+    /* 14 */ 0.325,  /* measured: M_16381                            */
+    /* 15 */ 1.303,  /* measured: M_32749                            */
+    /* 16 */ 5.536,  /* measured: M_65521                            */
+    /* 17 */ 22.872, /* projected: 5.536 × 4.1315                   */
+    /* 18 */ 94.497, /* projected: 22.872 × 4.1315                  */
+    /* 19 */ 390.416,/* projected: 94.497 × 4.1315                  */
+    /* 20 */ 1613.016,/* projected: 390.416 × 4.1315                */
+    /* 21 */ 6664.218,/* projected: 1613.016 × 4.1315               */
 };
-#define BUCKET_WORST_GROWTH 4.5   /* extrapolation factor for buckets > 21 */
+#define BUCKET_WORST_GROWTH 4.13  /* measured growth factor (B12–B16 geomean) */
 
-/* Safety margin applied to extrapolated estimates (buckets > 16) to account
- * for the uncertainty in the growth factor (observed trend: ×3.5, ×4.0, ×4.4,
- * still increasing).  A 20% buffer keeps workers safely inside the 6-h limit
- * even when the true per-exponent time slightly exceeds the 4.5× assumption. */
+/* Safety margin applied to projected/extrapolated estimates (buckets > 16).
+ * A 20% buffer keeps workers safely inside the 6-h limit even when the
+ * true per-exponent time slightly exceeds the projected value. */
 #define EXTRAPOLATED_SAFETY_MARGIN 1.2
 
 /* Return the estimated worst-case single-exponent time for bucket n.
