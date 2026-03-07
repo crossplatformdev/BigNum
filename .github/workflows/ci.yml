@@ -184,3 +184,59 @@ jobs:
           path: bin/bench_ci_*.csv
           retention-days: 30
 
+  # ──────────────────────────────────────────────────────────
+  # Job 5: cluster power (256 workers, 4 threads, 2 FFT, nested)
+  # ──────────────────────────────────────────────────────────
+  cluster-power:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ make libboost-dev pkg-config
+
+      - name: Build microbench binary
+        run: make bin/microbench_fft
+
+      - name: Run cluster power benchmark (256 workers x 4 LL-threads x 2 FFT-threads, nested)
+        run: |
+          echo "=== Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} ==="
+          echo "Job: cluster-power"
+          echo ""
+          make cluster-power \
+            CLUSTER_P=44497 \
+            CLUSTER_WORKERS=256 \
+            CLUSTER_THREADS=4 \
+            CLUSTER_FFT_THREADS=2 | tee cluster_power_report.txt
+
+      - name: Print summary
+        if: always()
+        run: |
+          echo "## Cluster Power Report" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Workflow run:** [${GITHUB_RUN_ID}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Parameter          | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| ------------------ | ----- |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Exponent p         | 44497 |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Cluster workers    | 256 |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| LL threads/worker  | 4 |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| FFT threads/worker | 2 (nested) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Total threads      | 1024 |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Results" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -A 99 "cluster power" cluster_power_report.txt >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload cluster power report
+        uses: actions/upload-artifact@v4
+        with:
+          name: cluster-power-report
+          path: cluster_power_report.txt
+          retention-days: 30
+

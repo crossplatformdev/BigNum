@@ -40,7 +40,7 @@ PERF_LDFLAGS  := -pthread
 CALLGRIND_CXXFLAGS := -std=c++20 -O2 -g -fno-omit-frame-pointer -march=native -mtune=native -pthread -Wall -Wextra -Wpedantic
 CALLGRIND_LDFLAGS  := -pthread
 
-.PHONY: all clean unit smoke regression test bench bench-ci prof perf-build callgrind-build perf-run callgrind-run discover discover-dry-run manual-sweep bucket bucket-dry-run plan-tool
+.PHONY: all clean unit smoke regression test bench bench-ci cluster-power prof perf-build callgrind-build perf-run callgrind-run discover discover-dry-run manual-sweep bucket bucket-dry-run plan-tool
 
 BENCH_START_INDEX ?= 14
 
@@ -140,6 +140,37 @@ bench-ci: $(BIN)
 	    ./$(BIN) $(BENCH_START_INDEX) $(BENCH_LL_THREADS)
 	@echo "--- 1-thread CSV ---" && cat bin/bench_ci_1t.csv
 	@echo "--- optimised CSV (LL=$(BENCH_LL_THREADS) FFT=$(BENCH_FFT_THREADS) nested=$(BENCH_FFT_ALLOW_NESTED)) ---" && cat bin/bench_ci_mt.csv
+
+# ---------------------------------------------------------------------------
+# cluster-power: measure FFT throughput and calculate theoretical cluster
+# performance in Teraflops and MIPS.
+#
+# Runs the microbench with the reference cluster configuration:
+#   256 workers, 4 LL-threads per worker, 2 FFT-threads per worker (nested).
+#
+# The microbench reports per-thread measured throughput and extrapolates to
+# the full cluster by multiplying by workers * ll_threads.
+#
+# Configurable via Makefile variables (override on the command line):
+#   make cluster-power CLUSTER_P=44497 CLUSTER_WORKERS=256 \
+#                      CLUSTER_THREADS=4 CLUSTER_FFT_THREADS=2
+# ---------------------------------------------------------------------------
+CLUSTER_P            ?= 44497
+CLUSTER_WORKERS      ?= 256
+CLUSTER_THREADS      ?= 4
+CLUSTER_FFT_THREADS  ?= 2
+
+cluster-power: $(MICROBENCH_BIN)
+	@echo "=== Cluster power benchmark ==="
+	@echo "  exponent       : p=$(CLUSTER_P)"
+	@echo "  cluster config : $(CLUSTER_WORKERS) workers x $(CLUSTER_THREADS) LL-threads x $(CLUSTER_FFT_THREADS) FFT-threads (nested)"
+	@echo ""
+	LL_FFT_THREADS=$(CLUSTER_FFT_THREADS) \
+	LL_FFT_ALLOW_NESTED=1 \
+	LL_CLUSTER_WORKERS=$(CLUSTER_WORKERS) \
+	LL_CLUSTER_THREADS=$(CLUSTER_THREADS) \
+	LL_CLUSTER_FFT_THREADS=$(CLUSTER_FFT_THREADS) \
+	./$(MICROBENCH_BIN) $(CLUSTER_P)
 
 # ---------------------------------------------------------------------------
 # bench: full interactive benchmark (1 thread vs max cores, start at index 14).
