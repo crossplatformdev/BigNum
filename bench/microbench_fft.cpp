@@ -7,6 +7,9 @@
 //   (a) total wall-clock time for MICROBENCH_ITERS (or p-2 if MICROBENCH_ITERS == 0) LL iterations
 //   (b) max_roundoff accumulated across all iterations
 //   (c) whether the final residue matches the expected result for a full run
+//   (d) theoretical Teraflops and MIPS for the measured configuration,
+//       with extrapolation to a configurable cluster (default: 256 workers,
+//       4 threads each, 2 FFT threads, nested).
 //
 // Build:
 //   make microbench                        (default p=44497, full p-2 iterations)
@@ -15,11 +18,17 @@
 // Usage:
 //   ./bin/microbench_fft [p]
 //   p defaults to 44497 (known Mersenne prime exponent, exercises FFT backend).
+//
+// Cluster power environment variables (override defaults):
+//   LL_CLUSTER_WORKERS    – number of worker nodes  (default 256)
+//   LL_CLUSTER_THREADS    – LL threads per worker   (default 4)
+//   LL_CLUSTER_FFT_THREADS– FFT threads per worker  (default taken from LL_FFT_THREADS, fallback 2)
 
 #define BIGNUM_NO_MAIN
 #include "../src/BigNum.cpp"
 
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -188,6 +197,109 @@ int main(int argc, char** argv) {
         std::printf("\n(partial run: %u/%u iters – residue comparison skipped)\n",
                     bench_iters, p_minus2);
     }
+
+    // -----------------------------------------------------------------------
+    // (d) Cluster power report.
+    //
+    // FLOPs per LL iteration (Crandall-Bailey DWT/FFT, real-FFT optimisation):
+    //
+    //   The hot path in FftMersenneBackend::step() performs one
+    //   square-sub-2-mod-Mersenne via a real-input convolution:
+    //     1. DWT forward weighting:         n   multiplications
+    //     2. Forward n/2-point complex FFT: 5*(n/2)*log2(n/2)  FLOPs
+    //     3. Real-FFT post + pointwise sq:  ~4*(n/2) FLOPs
+    //     4. Real-FFT pre  + IFFT n/2-pt:  5*(n/2)*log2(n/2) + 4*(n/2) FLOPs
+    //     5. DWT inverse weighting + norm:  n   multiplications
+    //     6. Carry propagation (x,floor,-): ~3*n FLOPs
+    //
+    //   Summing all components:
+    //     n + 5*(n/2)*(log2(n)-1) + 2*n + 2*n + 5*(n/2)*(log2(n)-1) + n + 3*n
+    //     = 5*n*log2(n) + 4*n
+    //
+    //   The formula used here is 5*n*log2(n), which omits the +4*n term.
+    //   For p=44497 (n=4096, log2(n)=12): +4*n adds ~6.7% to the total.
+    //   The simplified form is the standard FFT literature convention and
+    //   is used here for consistency with published FLOP-rate benchmarks.
+    //
+    // Instruction-count model for MIPS (theoretical estimate):
+    //   Modern CPUs with FMA execute one multiply-add per instruction (2 FLOPs).
+    //   Adding memory and integer overhead (~0.8x the FP instruction count):
+    //     instructions_per_iter ~= flops_per_iter / 2 * (1 + 0.8)
+    //                            = flops_per_iter * 0.9
+    //   This is a theoretical estimate.  Actual MIPS depends on micro-
+    //   architecture, vectorisation width, cache behaviour, and branch
+    //   prediction.  Profile with `perf stat` for hardware-measured values.
+    //
+    // Cluster extrapolation (theoretical upper bound):
+    //   The benchmark is run on a single node.  Cluster power is computed by
+    //   multiplying per-thread figures by workers * ll_threads, assuming each
+    //   worker node achieves the same throughput (ideal linear scaling).
+    //   Actual cluster performance will be lower due to memory bandwidth
+    //   contention, interconnect latency, and OS scheduling jitter.
+    // -----------------------------------------------------------------------
+
+    // --- Read cluster configuration (env vars, with defaults) ---
+    auto read_env_uint = [](const char* name, unsigned def) -> unsigned {
+        const char* s = std::getenv(name);
+        if (!s || *s == '\0') return def;
+        char* end = nullptr;
+        const long v = std::strtol(s, &end, 10);
+        return (end != s && v > 0) ? static_cast<unsigned>(v) : def;
+    };
+
+    // LL_FFT_THREADS is already used by the FftTeam inside the backend.
+    // Use it as the default for fft_threads_per_worker so reported config
+    // matches the actual run.
+    const unsigned fft_threads_env       = read_env_uint("LL_FFT_THREADS",         1u);
+    const unsigned cluster_workers       = read_env_uint("LL_CLUSTER_WORKERS",    256u);
+    const unsigned ll_threads_per_worker = read_env_uint("LL_CLUSTER_THREADS",      4u);
+    const unsigned fft_threads_per_worker= read_env_uint("LL_CLUSTER_FFT_THREADS", fft_threads_env);
+
+    // --- FLOPs per iteration (5*n*log2(n), standard FFT literature convention) ---
+    const size_t   fft_n           = st.n;   // transform length (power of 2)
+    const double   log2_n          = std::log2(static_cast<double>(fft_n));
+    const double   flops_per_iter  = 5.0 * static_cast<double>(fft_n) * log2_n;
+
+    // --- Single-thread throughput (measured) ---
+    const double iters_per_sec     = 1.0e9 / ns_per_iter;
+    const double gflops_per_thread = flops_per_iter * iters_per_sec / 1.0e9;
+
+    // --- Per-node throughput ---
+    // ll_threads_per_worker exponents run in parallel; each FFT uses
+    // fft_threads_per_worker threads (already reflected in ns_per_iter when
+    // LL_FFT_THREADS == fft_threads_per_worker).
+    const double gflops_per_node   = gflops_per_thread
+                                     * static_cast<double>(ll_threads_per_worker);
+    const double tflops_per_node   = gflops_per_node / 1.0e3;
+
+    // --- Cluster-wide throughput (theoretical, ideal linear scaling) ---
+    const double cluster_gflops    = gflops_per_node
+                                     * static_cast<double>(cluster_workers);
+    const double cluster_tflops    = cluster_gflops / 1.0e3;
+
+    // --- MIPS estimate (per thread, then scaled) ---
+    // instructions_per_iter ~= flops_per_iter * 0.9  (FMA + memory/integer overhead)
+    const double inst_per_iter     = flops_per_iter * 0.9;
+    const double mips_per_thread   = inst_per_iter * iters_per_sec / 1.0e6;
+    const double cluster_mips      = mips_per_thread
+                                     * static_cast<double>(cluster_workers)
+                                     * static_cast<double>(ll_threads_per_worker);
+
+    std::printf("\n--- cluster power (theoretical) ---\n");
+    std::printf("FFT length (n)              : %zu\n",  fft_n);
+    std::printf("FLOPs/iter                  : %.3e\n", flops_per_iter);
+    std::printf("iters/sec   (1 thread)      : %.0f\n", iters_per_sec);
+    std::printf("GFLOPs/s    (1 thread)      : %.3f\n", gflops_per_thread);
+    std::printf("\nCluster config              : %u workers x %u LL-threads x %u FFT-threads (nested)\n",
+                cluster_workers, ll_threads_per_worker, fft_threads_per_worker);
+    std::printf("GFLOPs/s    (per node)      : %.3f\n", gflops_per_node);
+    std::printf("TFLOPs/s    (per node)      : %.6f\n", tflops_per_node);
+    std::printf("TFLOPs/s    (cluster)       : %.4f\n", cluster_tflops);
+    std::printf("MIPS        (1 thread, est.): %.0f\n", mips_per_thread);
+    std::printf("MIPS        (cluster, est.) : %.0f\n", cluster_mips);
+    std::printf("\n(Note: cluster figures assume ideal linear scaling; actual"
+                " performance\n will be lower due to memory bandwidth and"
+                " scheduling overhead.)\n");
 
     return exit_code;
 }

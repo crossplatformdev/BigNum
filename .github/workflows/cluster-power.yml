@@ -1,0 +1,128 @@
+name: Cluster Power
+
+# Calculate theoretical cluster compute power (Teraflops and MIPS)
+# for a configurable number of workers, LL-threads, and FFT-threads.
+#
+# Default configuration: 256 workers, 4 threads each (2 FFT, nested).
+#
+# The benchmark runs on a single GitHub Actions runner and measures
+# per-thread FFT throughput for the Lucas-Lehmer hot path.  Cluster
+# power is then extrapolated by multiplying per-thread figures by
+# workers * ll_threads.
+#
+# Teraflops formula (Crandall-Bailey DWT/FFT, real-FFT optimisation):
+#   FLOPs/iter ~= 5 * n * log2(n)  where n = FFT transform length
+#   TFLOPs/s   = FLOPs/iter * iters/s * workers * ll_threads / 1e12
+#
+# MIPS estimate:
+#   instructions/iter ~= FLOPs/iter * 0.9  (FMA + memory/integer overhead)
+#   MIPS/s = instructions/iter * iters/s * workers * ll_threads / 1e6
+
+on:
+  workflow_dispatch:
+    inputs:
+      exponent:
+        description: "LL test exponent p (must exercise FftMersenneBackend, p >= 4000)"
+        required: false
+        default: "44497"
+        type: string
+      workers:
+        description: "Number of cluster worker nodes"
+        required: false
+        default: "256"
+        type: string
+      threads:
+        description: "LL worker threads per node"
+        required: false
+        default: "4"
+        type: string
+      fft_threads:
+        description: "FFT threads per LL worker (nested)"
+        required: false
+        default: "2"
+        type: string
+      nested:
+        description: "Enable nested FFT threading (LL_FFT_ALLOW_NESTED)"
+        required: false
+        default: "1"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  cluster-power:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++ make libboost-dev pkg-config
+
+      - name: Build microbench binary
+        run: make bin/microbench_fft
+
+      - name: Run cluster power benchmark
+        id: bench
+        run: |
+          P="${{ inputs.exponent }}"
+          WORKERS="${{ inputs.workers }}"
+          THREADS="${{ inputs.threads }}"
+          FFT_THREADS="${{ inputs.fft_threads }}"
+          NESTED="${{ inputs.nested }}"
+
+          echo "=== Cluster Power Benchmark ==="
+          echo "Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          echo "Job:          cluster-power"
+          echo ""
+          echo "Benchmark configuration:"
+          echo "  exponent p          : $P"
+          echo "  CPUs on runner      : $(nproc)"
+          echo "  LL_FFT_THREADS      : $FFT_THREADS"
+          echo "  LL_FFT_ALLOW_NESTED : $NESTED"
+          echo ""
+          echo "Cluster extrapolation config:"
+          echo "  workers             : $WORKERS"
+          echo "  LL threads/worker   : $THREADS"
+          echo "  FFT threads/worker  : $FFT_THREADS (nested=$NESTED)"
+          echo "  total threads       : $(( WORKERS * THREADS ))"
+          echo ""
+
+          LL_FFT_THREADS="$FFT_THREADS" \
+          LL_FFT_ALLOW_NESTED="$NESTED" \
+          LL_CLUSTER_WORKERS="$WORKERS" \
+          LL_CLUSTER_THREADS="$THREADS" \
+          LL_CLUSTER_FFT_THREADS="$FFT_THREADS" \
+          ./bin/microbench_fft "$P" | tee cluster_power_report.txt
+
+      - name: Print summary
+        if: always()
+        run: |
+          echo "## Cluster Power Report" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Workflow run:** [${GITHUB_RUN_ID}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Parameter            | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| -------------------- | ----- |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Exponent p           | ${{ inputs.exponent }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Cluster workers      | ${{ inputs.workers }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| LL threads/worker    | ${{ inputs.threads }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| FFT threads/worker   | ${{ inputs.fft_threads }} (nested=${{ inputs.nested }}) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Total threads        | $(( ${{ inputs.workers }} * ${{ inputs.threads }} )) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Results (from cluster_power_report.txt)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -A 99 "cluster power" cluster_power_report.txt >> "$GITHUB_STEP_SUMMARY" || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload cluster power report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cluster-power-report-p${{ inputs.exponent }}-w${{ inputs.workers }}-t${{ inputs.threads }}f${{ inputs.fft_threads }}
+          path: cluster_power_report.txt
+          retention-days: 30
