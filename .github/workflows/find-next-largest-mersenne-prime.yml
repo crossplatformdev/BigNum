@@ -463,6 +463,11 @@ jobs:
           print(json.dumps(done))
           " 2>/dev/null || echo '[]')
 
+          # Export all shell-local variables so the Python heredoc can read them
+          # via os.environ (shell heredoc variables are NOT automatically visible
+          # to child processes unless exported).
+          export NEXT_EXP CHK_ARTIFACT_NAME COMPLETED_JSON
+
           # Write chain state JSON using python3 to ensure valid JSON.
           python3 - <<'PYEOF'
           import json, hashlib, os, sys

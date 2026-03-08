@@ -1,6 +1,9 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <vector>
 
@@ -660,6 +663,160 @@ int main() {
             else
                 assert(r.final_residue_hex != "0000000000000000");
             check_residue_fmt(r.final_residue_hex);
+        }
+    }
+
+    // 17. Checkpoint round-trip: serialize + deserialize restores state correctly.
+    //     Verify that resuming from a mid-iteration checkpoint produces the same
+    //     final result as a fresh full run, across Generic, Limb, and FFT backends.
+    {
+        // Helper: run p for split_at iters, checkpoint, reload, finish, compare.
+        auto checkpoint_resume_test = [](uint32_t p, uint32_t split_at,
+                                         const char* tmpdir) {
+            // Full run reference result.
+            const bool ref_prime = mersenne::lucas_lehmer(p, false, /*benchmark_mode=*/true);
+
+            // Partial run: stop at split_at via a sub-epoch timestamp (1 second in past).
+            // We use run_checkpointed directly on the appropriate engine.
+            // Backend selection mirrors lucas_lehmer_checkpointed().
+            std::string chk_dir(tmpdir);
+            char fname_buf[256];
+            std::snprintf(fname_buf, sizeof(fname_buf), "%s/ll_chk_%010u.bin", tmpdir, p);
+            const std::string chk_path(fname_buf);
+
+            // Run to split_at iterations using checkpointed path with no soft-stop
+            // (we'll do a manual split via chk_interval = split_at).
+            const CheckpointRunResult partial = mersenne::lucas_lehmer_checkpointed(
+                p, /*progress=*/false, /*benchmark_mode=*/true,
+                /*resume_iter=*/0u, /*resume_data=*/nullptr, /*resume_data_len=*/0u,
+                chk_dir, /*chk_interval=*/split_at, /*soft_stop_epoch=*/0);
+
+            // Partial run may complete before split_at if p-2 < split_at.
+            if (partial.status != CheckpointStatus::soft_stopped) {
+                // Exponent completed in one go (p-2 <= split_at).
+                const bool chk_prime = (partial.status == CheckpointStatus::completed_prime);
+                assert(chk_prime == ref_prime);
+                return;
+            }
+
+            // A checkpoint file must have been written.
+            assert(!partial.chk_file.empty());
+            assert(std::filesystem::exists(partial.chk_file));
+
+            // Reload and verify the checkpoint.
+            LoadedCheckpoint lc = load_checkpoint_file(partial.chk_file);
+            assert(lc.valid);
+            assert(lc.p == p);
+            assert(lc.iter == split_at);
+            assert(!lc.data.empty());
+
+            // Resume from the checkpoint and complete.
+            const CheckpointRunResult resumed = mersenne::lucas_lehmer_checkpointed(
+                p, /*progress=*/false, /*benchmark_mode=*/true,
+                lc.iter, lc.data.data(), lc.data.size(),
+                chk_dir, /*chk_interval=*/0u, /*soft_stop_epoch=*/0);
+
+            const bool resumed_prime = (resumed.status == CheckpointStatus::completed_prime);
+            assert(resumed_prime == ref_prime);
+
+            // Clean up.
+            std::remove(partial.chk_file.c_str());
+        };
+
+        // Create a temp directory for checkpoint files.
+        const char* tmpdir = "/tmp/ll_chktest";
+        std::filesystem::create_directories(tmpdir);
+
+        // GenericBackend (p < 128): p=13 (prime), p=11 (composite).
+        checkpoint_resume_test(13u,  5u, tmpdir);  // split mid-run
+        checkpoint_resume_test(11u,  3u, tmpdir);  // split mid-run
+        checkpoint_resume_test(7u,   1u, tmpdir);  // split at first iter
+
+        // LimbBackend (128 <= p < ~4000): p=521 (prime), split at 100 iters.
+        checkpoint_resume_test(521u, 100u, tmpdir);
+
+        // LimbBackend: p=2203 (prime), split at 500 iters.
+        checkpoint_resume_test(2203u, 500u, tmpdir);
+
+        // FftMersenneBackend (p >= 4000): p=4253 (prime), split at 1000 iters.
+        checkpoint_resume_test(4253u, 1000u, tmpdir);
+
+        // FftMersenneBackend: p=4423 (prime), split at 2000 iters.
+        checkpoint_resume_test(4423u, 2000u, tmpdir);
+    }
+
+    // 18. Checkpoint file format: magic, version, backend_id, checksum.
+    {
+        const char* tmpdir = "/tmp/ll_chkfmttest";
+        std::filesystem::create_directories(tmpdir);
+        const std::string chk_path = std::string(tmpdir) + "/ll_chk_0000000013.bin";
+
+        // Run GenericBackend checkpoint for p=13 at iter 3.
+        const CheckpointRunResult r = mersenne::lucas_lehmer_checkpointed(
+            13u, false, true,
+            0u, nullptr, 0u,
+            std::string(tmpdir), 3u, 0);
+        // May or may not have checkpointed depending on iteration count.
+        // Either way, verify load/save round-trip via manual file check.
+        if (!r.chk_file.empty()) {
+            LoadedCheckpoint lc = load_checkpoint_file(r.chk_file);
+            assert(lc.valid);
+            assert(lc.p == 13u);
+            assert(lc.backend_id == kChkBkGeneric);
+            assert(lc.iter <= 11u);  // p-2 = 11
+            std::remove(r.chk_file.c_str());
+        }
+
+        // Corrupt file: truncated (should fail gracefully).
+        {
+            const std::string bad_path = std::string(tmpdir) + "/bad.bin";
+            FILE* f = std::fopen(bad_path.c_str(), "wb");
+            assert(f);
+            const uint8_t garbage[] = {'L', 'L', 'C', 'K', 1, 0, 0, 0};
+            std::fwrite(garbage, 1, sizeof(garbage), f);
+            std::fclose(f);
+            LoadedCheckpoint lc = load_checkpoint_file(bad_path);
+            assert(!lc.valid);
+            std::remove(bad_path.c_str());
+        }
+
+        // Corrupt file: wrong magic (should fail gracefully).
+        {
+            const std::string bad_path = std::string(tmpdir) + "/badmagic.bin";
+            FILE* f = std::fopen(bad_path.c_str(), "wb");
+            assert(f);
+            const uint8_t buf[28] = {'X', 'X', 'X', 'X', 1, 0, 0, 0,
+                                      0, 0, 0, 0, 0, 0, 0, 0,
+                                      0, 0, 0, 0,
+                                      0, 0, 0, 0, 0, 0, 0, 0};
+            std::fwrite(buf, 1, sizeof(buf), f);
+            std::fclose(f);
+            LoadedCheckpoint lc = load_checkpoint_file(bad_path);
+            assert(!lc.valid);
+            std::remove(bad_path.c_str());
+        }
+
+        // Corrupt file: bad checksum (should fail gracefully).
+        {
+            // Build a valid checkpoint, then flip the last byte.
+            const CheckpointRunResult rc = mersenne::lucas_lehmer_checkpointed(
+                7u, false, true, 0u, nullptr, 0u,
+                std::string(tmpdir), 1u, 0);
+            if (!rc.chk_file.empty()) {
+                // Open and flip the last byte.
+                FILE* f = std::fopen(rc.chk_file.c_str(), "r+b");
+                assert(f);
+                std::fseek(f, -1, SEEK_END);
+                uint8_t b = 0;
+                [[maybe_unused]] const size_t nr = std::fread(&b, 1, 1, f);
+                b ^= 0xFFu;
+                std::fseek(f, -1, SEEK_END);
+                std::fwrite(&b, 1, 1, f);
+                std::fclose(f);
+                LoadedCheckpoint lc = load_checkpoint_file(rc.chk_file);
+                assert(!lc.valid);
+                std::remove(rc.chk_file.c_str());
+            }
         }
     }
 

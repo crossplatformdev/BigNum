@@ -514,19 +514,10 @@ struct LoadedCheckpoint {
     bool valid{false};
 };
 
-// Simple additive checksum: sufficient to detect file truncation/corruption.
-static uint32_t chk_addsum(const uint8_t* buf, size_t len) noexcept {
-    uint32_t s = 0u;
-    for (size_t i = 0u; i < len; ++i) s += buf[i];
-    return s;
-}
-
-// Append a 32-bit unsigned integer v as four consecutive little-endian bytes to buf.
-static void push_le32(std::vector<uint8_t>& buf, uint32_t v) {
-    buf.push_back(static_cast<uint8_t>(v));
-    buf.push_back(static_cast<uint8_t>(v >>  8));
-    buf.push_back(static_cast<uint8_t>(v >> 16));
-    buf.push_back(static_cast<uint8_t>(v >> 24));
+// Accumulate additive checksum into an existing value (for streaming writes).
+static uint32_t chk_addsum_acc(uint32_t acc, const uint8_t* buf, size_t len) noexcept {
+    for (size_t i = 0u; i < len; ++i) acc += buf[i];
+    return acc;
 }
 
 // Read a 32-bit unsigned integer from four consecutive little-endian bytes at buf[0..3].
@@ -538,6 +529,8 @@ static uint32_t read_le32(const uint8_t* buf) noexcept {
 }
 
 // Atomically write a checkpoint file (write to .tmp then rename).
+// Streams data directly to the file to avoid duplicating the state blob in
+// memory: writes the fixed header, then the backend state, then the checksum.
 static bool save_checkpoint_file(
     const std::string& path,
     uint8_t            backend_id,
@@ -545,18 +538,36 @@ static bool save_checkpoint_file(
     uint32_t           iter,
     const std::vector<uint8_t>& data)
 {
-    std::vector<uint8_t> buf;
-    buf.reserve(24u + data.size() + 4u);
+    // Build 20-byte header.
+    uint8_t hdr[20];
+    hdr[0]='L'; hdr[1]='L'; hdr[2]='C'; hdr[3]='K';
+    hdr[4] = kChkVersion;
+    hdr[5] = backend_id;
+    hdr[6] = 0u; hdr[7] = 0u;  // padding
+    const uint32_t p_le   = p;
+    const uint32_t i_le   = iter;
+    const uint32_t dsz_le = static_cast<uint32_t>(data.size());
+    hdr[ 8] = static_cast<uint8_t>(p_le);
+    hdr[ 9] = static_cast<uint8_t>(p_le >>  8);
+    hdr[10] = static_cast<uint8_t>(p_le >> 16);
+    hdr[11] = static_cast<uint8_t>(p_le >> 24);
+    hdr[12] = static_cast<uint8_t>(i_le);
+    hdr[13] = static_cast<uint8_t>(i_le >>  8);
+    hdr[14] = static_cast<uint8_t>(i_le >> 16);
+    hdr[15] = static_cast<uint8_t>(i_le >> 24);
+    hdr[16] = static_cast<uint8_t>(dsz_le);
+    hdr[17] = static_cast<uint8_t>(dsz_le >>  8);
+    hdr[18] = static_cast<uint8_t>(dsz_le >> 16);
+    hdr[19] = static_cast<uint8_t>(dsz_le >> 24);
 
-    buf.push_back('L'); buf.push_back('L'); buf.push_back('C'); buf.push_back('K');
-    buf.push_back(kChkVersion);
-    buf.push_back(backend_id);
-    buf.push_back(0u); buf.push_back(0u);  // padding
-    push_le32(buf, p);
-    push_le32(buf, iter);
-    push_le32(buf, static_cast<uint32_t>(data.size()));
-    buf.insert(buf.end(), data.begin(), data.end());
-    push_le32(buf, chk_addsum(buf.data(), buf.size()));
+    // Compute checksum over header + data without copying data into a separate buffer.
+    uint32_t cs = chk_addsum_acc(0u, hdr, sizeof(hdr));
+    cs = chk_addsum_acc(cs, data.data(), data.size());
+    uint8_t cs_buf[4];
+    cs_buf[0] = static_cast<uint8_t>(cs);
+    cs_buf[1] = static_cast<uint8_t>(cs >>  8);
+    cs_buf[2] = static_cast<uint8_t>(cs >> 16);
+    cs_buf[3] = static_cast<uint8_t>(cs >> 24);
 
     const std::string tmp = path + ".tmp";
     FILE* f = std::fopen(tmp.c_str(), "wb");
@@ -565,10 +576,14 @@ static bool save_checkpoint_file(
                      tmp.c_str(), std::strerror(errno));
         return false;
     }
-    const size_t written = std::fwrite(buf.data(), 1u, buf.size(), f);
+
+    bool ok = (std::fwrite(hdr,           1u, sizeof(hdr),     f) == sizeof(hdr));
+    ok = ok && (std::fwrite(data.data(),  1u, data.size(),     f) == data.size());
+    ok = ok && (std::fwrite(cs_buf,       1u, sizeof(cs_buf),  f) == sizeof(cs_buf));
     std::fflush(f);
     std::fclose(f);
-    if (written != buf.size()) {
+
+    if (!ok) {
         std::fprintf(stderr, "checkpoint: short write to '%s'\n", tmp.c_str());
         std::remove(tmp.c_str());
         return false;
@@ -582,49 +597,71 @@ static bool save_checkpoint_file(
     return true;
 }
 
-// Load and validate a checkpoint file.  Returns an invalid checkpoint on error.
+// Load and validate a checkpoint file.
+// Reads the 20-byte header first, then streams the state blob directly into
+// out.data to avoid keeping two full-size copies in memory at once.
 static LoadedCheckpoint load_checkpoint_file(const std::string& path) {
     LoadedCheckpoint out;
     FILE* f = std::fopen(path.c_str(), "rb");
     if (!f) return out;
-    std::fseek(f, 0, SEEK_END);
+
+    if (std::fseek(f, 0, SEEK_END) != 0) { std::fclose(f); return out; }
     const long flen = std::ftell(f);
-    std::fseek(f, 0, SEEK_SET);
-    if (flen < 28) { std::fclose(f); return out; }  // minimum: 24 hdr + 0 data + 4 sum
+    if (flen < 0)  { std::fclose(f); return out; }
+    if (std::fseek(f, 0, SEEK_SET) != 0) { std::fclose(f); return out; }
 
-    std::vector<uint8_t> buf(static_cast<size_t>(flen));
-    const size_t n = std::fread(buf.data(), 1u, buf.size(), f);
+    // Minimum: 20-byte header + 0 data + 4-byte checksum = 24 bytes.
+    if (flen < 24) { std::fclose(f); return out; }
+
+    // Read and validate the fixed header (20 bytes).
+    uint8_t hdr[20];
+    if (std::fread(hdr, 1u, sizeof(hdr), f) != sizeof(hdr)) {
+        std::fclose(f); return out;
+    }
+    if (hdr[0] != 'L' || hdr[1] != 'L' || hdr[2] != 'C' || hdr[3] != 'K') {
+        std::fprintf(stderr, "checkpoint: bad magic in '%s'\n", path.c_str());
+        std::fclose(f); return out;
+    }
+    if (hdr[4] != kChkVersion) {
+        std::fprintf(stderr, "checkpoint: unsupported version %u in '%s'\n",
+                     static_cast<unsigned>(hdr[4]), path.c_str());
+        std::fclose(f); return out;
+    }
+    out.backend_id = hdr[5];
+    out.p    = read_le32(hdr + 8);
+    out.iter = read_le32(hdr + 12);
+    const uint32_t dsz = read_le32(hdr + 16);
+
+    const size_t expected_total = 20u + static_cast<size_t>(dsz) + 4u;
+    if (expected_total != static_cast<size_t>(flen)) {
+        std::fprintf(stderr, "checkpoint: size mismatch in '%s'\n", path.c_str());
+        std::fclose(f); return out;
+    }
+
+    // Read the state blob directly into out.data.
+    uint32_t cs = chk_addsum_acc(0u, hdr, sizeof(hdr));
+    out.data.resize(dsz);
+    if (dsz > 0u) {
+        if (std::fread(out.data.data(), 1u, dsz, f) != dsz) {
+            std::fclose(f); out.data.clear(); return out;
+        }
+        cs = chk_addsum_acc(cs, out.data.data(), dsz);
+    }
+
+    // Read and verify the stored checksum (4 bytes).
+    uint8_t cs_buf[4];
+    if (std::fread(cs_buf, 1u, sizeof(cs_buf), f) != sizeof(cs_buf)) {
+        std::fclose(f); out.data.clear(); return out;
+    }
     std::fclose(f);
-    if (n != buf.size()) return out;
 
-    // Verify checksum (last 4 bytes).
-    const size_t cs_off = buf.size() - 4u;
-    const uint32_t stored  = read_le32(buf.data() + cs_off);
-    const uint32_t computed = chk_addsum(buf.data(), cs_off);
-    if (stored != computed) {
+    const uint32_t stored = read_le32(cs_buf);
+    if (stored != cs) {
         std::fprintf(stderr,
             "checkpoint: checksum mismatch in '%s' (stored=%u computed=%u)\n",
-            path.c_str(), stored, computed);
-        return out;
+            path.c_str(), stored, cs);
+        out.data.clear(); return out;
     }
-    if (buf[0] != 'L' || buf[1] != 'L' || buf[2] != 'C' || buf[3] != 'K') {
-        std::fprintf(stderr, "checkpoint: bad magic in '%s'\n", path.c_str());
-        return out;
-    }
-    if (buf[4] != kChkVersion) {
-        std::fprintf(stderr, "checkpoint: unsupported version %u in '%s'\n",
-                     static_cast<unsigned>(buf[4]), path.c_str());
-        return out;
-    }
-    out.backend_id = buf[5];
-    out.p    = read_le32(buf.data() + 8);
-    out.iter = read_le32(buf.data() + 12);
-    const uint32_t dsz = read_le32(buf.data() + 16);
-    if (20u + static_cast<size_t>(dsz) + 4u != buf.size()) {
-        std::fprintf(stderr, "checkpoint: size mismatch in '%s'\n", path.c_str());
-        return out;
-    }
-    out.data.assign(buf.begin() + 20, buf.begin() + 20 + dsz);
     out.valid = true;
     return out;
 }
@@ -2363,17 +2400,34 @@ public:
             // Soft-stop check every 10 000 iterations to amortize time() overhead.
             if (soft_stop_epoch != 0 && (i + 1u) % 10000u == 0u) {
                 if (static_cast<int64_t>(std::time(nullptr)) >= soft_stop_epoch) {
-                    // Save checkpoint and exit with soft_stopped status.
+                    // Must save a checkpoint before returning soft_stopped, otherwise
+                    // the workflow would get stuck restarting from iteration 0 forever.
+                    bool chk_ok = false;
                     if (!chk_path.empty()) {
-                        std::vector<uint8_t> data;
-                        Backend::serialize_state(state_, data);
+                        std::vector<uint8_t> chk_data;
+                        Backend::serialize_state(state_, chk_data);
                         if (save_checkpoint_file(chk_path, Backend::backend_id(),
-                                                 p_, i + 1u, data))
+                                                 p_, i + 1u, chk_data)) {
                             result.chk_file = chk_path;
+                            chk_ok = true;
+                        } else {
+                            std::fprintf(stderr,
+                                "ERROR: soft-stop reached but checkpoint write to '%s' failed;"
+                                " continuing to avoid losing progress.\n",
+                                chk_path.c_str());
+                        }
+                    } else {
+                        std::fprintf(stderr,
+                            "ERROR: soft-stop reached but checkpointing is disabled"
+                            " (no checkpoint path); continuing to avoid losing progress.\n");
                     }
-                    result.status     = CheckpointStatus::soft_stopped;
-                    result.iters_done = i + 1u;
-                    return result;
+                    if (chk_ok) {
+                        result.status     = CheckpointStatus::soft_stopped;
+                        result.iters_done = i + 1u;
+                        return result;
+                    }
+                    // Checkpoint write failed – continue running rather than returning
+                    // soft_stopped without a usable checkpoint file.
                 }
             }
 
@@ -2813,9 +2867,16 @@ static bool env_bool(const char* name, bool def = false) {
 }
 
 // Parse a signed 64-bit integer from an environment variable (used for epoch timestamps).
+// Negative values are treated as invalid (epoch timestamps must be non-negative).
 static int64_t env_int64(const char* name, int64_t def) {
     const char* s = std::getenv(name);
     if (!s || !*s) return def;
+    if (s[0] == '-') {
+        std::fprintf(stderr,
+                     "Invalid %s='%s' (negative epoch); using default %" PRId64 "\n",
+                     name, s, def);
+        return def;
+    }
     char* end = nullptr;
     errno = 0;
     const long long v = std::strtoll(s, &end, 10);
@@ -2848,11 +2909,18 @@ static int run_discover_mode(int argc, char** argv) {
     const bool dry_run          = env_bool("LL_DRY_RUN");
     const bool progress         = env_bool("LL_PROGRESS");
 
-    // Checkpoint / soft-stop parameters (ignored unless LL_CHECKPOINT_DIR is set).
-    const std::string chk_dir       = env_string("LL_CHECKPOINT_DIR");
-    const uint32_t    chk_interval  = env_uint32("LL_CHECKPOINT_INTERVAL_ITERS", 0u);
-    const int64_t     soft_stop_epoch = env_int64("LL_SOFT_STOP_EPOCH_SECS", 0);
-    const std::string resume_chk_file = env_string("LL_RESUME_CHECKPOINT_FILE");
+    // Checkpoint / soft-stop parameters.
+    // Soft-stop and resume are only honored when a checkpoint directory is
+    // configured (LL_CHECKPOINT_DIR).  Requiring a directory ensures that a
+    // timed-out run always produces a usable checkpoint and never exits with
+    // code 4 without an actual checkpoint file.
+    const std::string chk_dir           = env_string("LL_CHECKPOINT_DIR");
+    const uint32_t    chk_interval      = chk_dir.empty() ? 0u
+        : env_uint32("LL_CHECKPOINT_INTERVAL_ITERS", 0u);
+    const int64_t     soft_stop_epoch   = chk_dir.empty() ? int64_t(0)
+        : env_int64("LL_SOFT_STOP_EPOCH_SECS", 0);
+    const std::string resume_chk_file   = chk_dir.empty() ? std::string()
+        : env_string("LL_RESUME_CHECKPOINT_FILE");
 
     unsigned threads = maxCores;
     if (argc >= 3 && argv[2] && argv[2][0] != '\0') {
@@ -2985,10 +3053,37 @@ static int run_discover_mode(int argc, char** argv) {
         if (!resume_chk_file.empty() && i == 0u) {
             LoadedCheckpoint lc = load_checkpoint_file(resume_chk_file);
             if (lc.valid && lc.p == p32) {
+                // Validate that the checkpoint was created with the same backend
+                // that this run would select.  If the crossover config changed between
+                // runs the deserialized state would be interpreted incorrectly.
+                const uint8_t expected_bk = [&]() -> uint8_t {
+                    if (p32 < 128u)  return kChkBkGeneric;
+                    // Mirror the crossover used in lucas_lehmer_checkpointed().
+                    const char* env = std::getenv("LL_LIMB_FFT_CROSSOVER");
+                    uint32_t xover = 4000u;
+                    if (env && *env) {
+                        char* ep = nullptr;
+                        const long v = std::strtol(env, &ep, 10);
+                        if (ep != env && *ep == '\0' && v > 0 && v < 1000000L)
+                            xover = static_cast<uint32_t>(v);
+                    }
+                    return (p32 < xover) ? kChkBkLimb : kChkBkFft;
+                }();
+                if (lc.backend_id != expected_bk) {
+                    std::fprintf(stderr,
+                        "ERROR: checkpoint for M_%" PRIu64 " was written with backend_id=%u"
+                        " but current run expects backend_id=%u (crossover config mismatch).\n"
+                        "Run the same configuration to resume, or delete the checkpoint to"
+                        " restart from iteration 0.\n",
+                        p, static_cast<unsigned>(lc.backend_id),
+                        static_cast<unsigned>(expected_bk));
+                    std::fflush(stderr);
+                    std::exit(EXIT_FAILURE);
+                }
                 resume_iter = lc.iter;
                 resume_data = std::move(lc.data);
-                std::printf("  Resuming M_%" PRIu64 " from checkpoint: iter=%u\n",
-                            p, resume_iter);
+                std::printf("  Resuming M_%" PRIu64 " from checkpoint: iter=%u (backend_id=%u)\n",
+                            p, resume_iter, static_cast<unsigned>(expected_bk));
             } else if (lc.valid) {
                 std::fprintf(stderr,
                     "Warning: checkpoint exponent %u != current exponent %" PRIu64
@@ -3001,7 +3096,8 @@ static int run_discover_mode(int argc, char** argv) {
         std::string chk_written;
 
         // Use checkpointed path when checkpoint dir is configured.
-        if (!chk_dir.empty() || soft_stop_epoch != 0) {
+        // soft_stop_epoch is always 0 when chk_dir is empty (enforced above).
+        if (!chk_dir.empty()) {
             // Ensure checkpoint directory exists.
             if (!chk_dir.empty()) {
                 if (ll_mkdir(chk_dir.c_str(), 0755) != 0 && errno != EEXIST)

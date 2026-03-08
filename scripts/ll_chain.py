@@ -83,8 +83,11 @@ def is_prime(n: int) -> bool:
 
     Uses deterministic Miller-Rabin witness sets that are proven correct up to
     3 317 044 064 679 887 385 961 981 (≈ 3.3 × 10²⁴).  For n beyond that
-    range the test falls back to a probabilistic 20-round Miller-Rabin which
-    has a per-witness error probability < 4⁻²⁰ ≈ 10⁻¹².
+    range the test falls back to a fixed-witness Miller-Rabin with 20 bases,
+    which is a strong pseudoprime test rather than a probabilistic one – the
+    error probability guarantee (< 4⁻²⁰) applies only when witnesses are
+    chosen uniformly at random.  In practice, exponents tested in this tool
+    are always < 2³² and therefore fall within the deterministic range.
     """
     if n < 2:
         return False
