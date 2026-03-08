@@ -173,7 +173,7 @@ jobs:
           echo "Best config: LL_THREADS=4 LL_FFT_THREADS=2 LL_FFT_ALLOW_NESTED=1  (37% faster than single-thread)"
 
       # Run the standard bench-ci with the tuned defaults (LL=4, FFT=2, nested=1).
-      - name: Run bounded CI benchmark (best config: LL=4, FFT=2, nested=1)
+      - name: "Run bounded CI benchmark (best config: LL=4, FFT=2, nested=1)"
         run: |
           make bench-ci BENCH_LL_THREADS=4 BENCH_FFT_THREADS=2 BENCH_FFT_ALLOW_NESTED=1
 

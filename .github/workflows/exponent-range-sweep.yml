@@ -315,7 +315,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: range-sweep-merged-results
-          path: merged_results.zip          retention-days: 90
+          path: merged_results.zip
+          retention-days: 90
           compression-level: 9
 
       - name: Write workflow step summary

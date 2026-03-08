@@ -167,10 +167,9 @@ jobs:
           CHUNK_COUNT=$(echo "${CHUNK_INFO}"   | python3 -c "import json,sys; print(json.loads(sys.stdin.read())['chunk_count'])")
 
           # Build the chunk matrix: [{"chunk_index": "0"}, {"chunk_index": "1"}, ...]
-          CHUNK_MATRIX=$(python3 -c "
-import json, sys
-n = int('${CHUNK_COUNT}')
-print(json.dumps([{'chunk_index': str(i)} for i in range(n)]))")
+          # Note: kept as a one-liner to avoid unindented Python lines breaking
+          # the YAML literal block scalar (lines at column 0 end the run: | block).
+          CHUNK_MATRIX=$(python3 -c "import json; n=int('${CHUNK_COUNT}'); print(json.dumps([{'chunk_index': str(i)} for i in range(n)]))")
 
           echo "total_batches=${TOTAL_BATCHES}"      >> "$GITHUB_OUTPUT"
           echo "chunk_count=${CHUNK_COUNT}"           >> "$GITHUB_OUTPUT"
