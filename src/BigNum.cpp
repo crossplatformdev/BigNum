@@ -2473,6 +2473,27 @@ private:
 // ============================================================
 namespace mersenne {
 
+// Shared helper: read LL_LIMB_FFT_CROSSOVER from the environment once.
+// Returns the crossover exponent threshold between LimbBackend and FftMersenneBackend.
+// The threshold is capped at kMaxCrossoverCap and defaults to 4000 if unset or invalid.
+static constexpr uint32_t kMaxCrossoverCap = 1000000u;
+static uint32_t limb_fft_crossover() {
+    static const uint32_t value = []() -> uint32_t {
+        const char* env = std::getenv("LL_LIMB_FFT_CROSSOVER");
+        if (env && *env) {
+            char* end = nullptr;
+            const long v = std::strtol(env, &end, 10);
+            if (end != env && *end == '\0' && v > 0 &&
+                v < static_cast<long>(kMaxCrossoverCap))
+                return static_cast<uint32_t>(v);
+            std::fprintf(stderr,
+                "LL_LIMB_FFT_CROSSOVER='%s' is invalid; using default 4000\n", env);
+        }
+        return 4000u;
+    }();
+    return value;
+}
+
 bool lucas_lehmer(uint32_t p, bool progress, bool benchmark_mode = false) {
     if (p < 2u) return false;
     if (p == 2u) return true;
@@ -2492,21 +2513,7 @@ bool lucas_lehmer(uint32_t p, bool progress, bool benchmark_mode = false) {
     //   p=4253 (67 limbs): LimbBackend ~50ms vs FFT ~32ms → FFT wins.
     //   Crossover observed near p≈4000; tune with `make bench` on the target CPU.
     //   Override at runtime via the LL_LIMB_FFT_CROSSOVER environment variable.
-    // Upper bound: no known Mersenne exponent exceeds 100 million digits (p < 10^9),
-    // so 1 000 000 is a safe sanity cap for the crossover threshold.
-    static constexpr uint32_t kMaxCrossoverThreshold = 1000000u;
-    static const uint32_t kLimbFftCrossover = []() -> uint32_t {
-        const char* env = std::getenv("LL_LIMB_FFT_CROSSOVER");
-        if (env && *env) {
-            char* end = nullptr;
-            const long v = std::strtol(env, &end, 10);
-            if (end != env && *end == '\0' && v > 0 && v < static_cast<long>(kMaxCrossoverThreshold))
-                return static_cast<uint32_t>(v);
-            std::fprintf(stderr,
-                "LL_LIMB_FFT_CROSSOVER='%s' is invalid; using default 4000\n", env);
-        }
-        return 4000u;
-    }();
+    const uint32_t kLimbFftCrossover = limb_fft_crossover();
     if (p < kLimbFftCrossover) {
         LucasLehmerEngine<backend::LimbBackend> eng(p, /*benchmark_mode=*/true);
         return eng.run(progress);
@@ -2531,16 +2538,7 @@ LLResult lucas_lehmer_ex(uint32_t p, bool progress, bool benchmark_mode,
         return eng.run_ex(progress, ctx);
     }
     // Reuse the same crossover threshold logic as lucas_lehmer().
-    static const uint32_t kCrossoverEx = []() -> uint32_t {
-        const char* env = std::getenv("LL_LIMB_FFT_CROSSOVER");
-        if (env && *env) {
-            char* end = nullptr;
-            const long v = std::strtol(env, &end, 10);
-            if (end != env && *end == '\0' && v > 0 && v < 1000000L)
-                return static_cast<uint32_t>(v);
-        }
-        return 4000u;
-    }();
+    const uint32_t kCrossoverEx = limb_fft_crossover();
     if (p < kCrossoverEx) {
         LucasLehmerEngine<backend::LimbBackend> eng(p, /*benchmark_mode=*/true);
         return eng.run_ex(progress, ctx);
@@ -2572,16 +2570,7 @@ CheckpointRunResult lucas_lehmer_checkpointed(
     }
 
     // Reuse same crossover threshold as lucas_lehmer().
-    static const uint32_t kCrossoverChk = []() -> uint32_t {
-        const char* env = std::getenv("LL_LIMB_FFT_CROSSOVER");
-        if (env && *env) {
-            char* end = nullptr;
-            const long v = std::strtol(env, &end, 10);
-            if (end != env && *end == '\0' && v > 0 && v < 1000000L)
-                return static_cast<uint32_t>(v);
-        }
-        return 4000u;
-    }();
+    const uint32_t kCrossoverChk = limb_fft_crossover();
 
     if (p < kCrossoverChk) {
         LucasLehmerEngine<backend::LimbBackend> eng(p, benchmark_mode);
@@ -2866,22 +2855,22 @@ static bool env_bool(const char* name, bool def = false) {
            std::strcmp(s, "yes") == 0;
 }
 
-// Parse a signed 64-bit integer from an environment variable (used for epoch timestamps).
-// Negative values are treated as invalid (epoch timestamps must be non-negative).
+// Parse a non-negative 64-bit integer from an environment variable (used for epoch timestamps).
+// Rejects negative values after full parsing (handles leading whitespace and edge cases like "-0").
 static int64_t env_int64(const char* name, int64_t def) {
     const char* s = std::getenv(name);
     if (!s || !*s) return def;
-    if (s[0] == '-') {
-        std::fprintf(stderr,
-                     "Invalid %s='%s' (negative epoch); using default %" PRId64 "\n",
-                     name, s, def);
-        return def;
-    }
     char* end = nullptr;
     errno = 0;
     const long long v = std::strtoll(s, &end, 10);
     if (errno != 0 || end == s || *end != '\0') {
         std::fprintf(stderr, "Invalid %s='%s'; using default %" PRId64 "\n",
+                     name, s, def);
+        return def;
+    }
+    if (v < 0) {
+        std::fprintf(stderr,
+                     "Invalid %s='%s' (negative epoch); using default %" PRId64 "\n",
                      name, s, def);
         return def;
     }
@@ -3057,17 +3046,8 @@ static int run_discover_mode(int argc, char** argv) {
                 // that this run would select.  If the crossover config changed between
                 // runs the deserialized state would be interpreted incorrectly.
                 const uint8_t expected_bk = [&]() -> uint8_t {
-                    if (p32 < 128u)  return kChkBkGeneric;
-                    // Mirror the crossover used in lucas_lehmer_checkpointed().
-                    const char* env = std::getenv("LL_LIMB_FFT_CROSSOVER");
-                    uint32_t xover = 4000u;
-                    if (env && *env) {
-                        char* ep = nullptr;
-                        const long v = std::strtol(env, &ep, 10);
-                        if (ep != env && *ep == '\0' && v > 0 && v < 1000000L)
-                            xover = static_cast<uint32_t>(v);
-                    }
-                    return (p32 < xover) ? kChkBkLimb : kChkBkFft;
+                    if (p32 < 128u) return kChkBkGeneric;
+                    return (p32 < mersenne::limb_fft_crossover()) ? kChkBkLimb : kChkBkFft;
                 }();
                 if (lc.backend_id != expected_bk) {
                     std::fprintf(stderr,

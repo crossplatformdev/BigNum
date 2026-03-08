@@ -672,16 +672,17 @@ int main() {
     {
         // Helper: run p for split_at iters, checkpoint, reload, finish, compare.
         auto checkpoint_resume_test = [](uint32_t p, uint32_t split_at,
-                                         const char* tmpdir) {
+                                         const std::string& tmpdir) {
             // Full run reference result.
             const bool ref_prime = mersenne::lucas_lehmer(p, false, /*benchmark_mode=*/true);
 
             // Partial run: stop at split_at via a sub-epoch timestamp (1 second in past).
             // We use run_checkpointed directly on the appropriate engine.
             // Backend selection mirrors lucas_lehmer_checkpointed().
-            std::string chk_dir(tmpdir);
+            const std::string chk_dir = tmpdir;
             char fname_buf[256];
-            std::snprintf(fname_buf, sizeof(fname_buf), "%s/ll_chk_%010u.bin", tmpdir, p);
+            std::snprintf(fname_buf, sizeof(fname_buf), "%s/ll_chk_%010u.bin",
+                          tmpdir.c_str(), p);
             const std::string chk_path(fname_buf);
 
             // Run to split_at iterations using checkpointed path with no soft-stop
@@ -724,7 +725,8 @@ int main() {
         };
 
         // Create a temp directory for checkpoint files.
-        const char* tmpdir = "/tmp/ll_chktest";
+        const std::string tmpdir =
+            (std::filesystem::temp_directory_path() / "ll_chktest").string();
         std::filesystem::create_directories(tmpdir);
 
         // GenericBackend (p < 128): p=13 (prime), p=11 (composite).
@@ -747,15 +749,15 @@ int main() {
 
     // 18. Checkpoint file format: magic, version, backend_id, checksum.
     {
-        const char* tmpdir = "/tmp/ll_chkfmttest";
+        const std::string tmpdir =
+            (std::filesystem::temp_directory_path() / "ll_chkfmttest").string();
         std::filesystem::create_directories(tmpdir);
-        const std::string chk_path = std::string(tmpdir) + "/ll_chk_0000000013.bin";
 
         // Run GenericBackend checkpoint for p=13 at iter 3.
         const CheckpointRunResult r = mersenne::lucas_lehmer_checkpointed(
             13u, false, true,
             0u, nullptr, 0u,
-            std::string(tmpdir), 3u, 0);
+            tmpdir, 3u, 0);
         // May or may not have checkpointed depending on iteration count.
         // Either way, verify load/save round-trip via manual file check.
         if (!r.chk_file.empty()) {
@@ -769,7 +771,7 @@ int main() {
 
         // Corrupt file: truncated (should fail gracefully).
         {
-            const std::string bad_path = std::string(tmpdir) + "/bad.bin";
+            const std::string bad_path = tmpdir + "/bad.bin";
             FILE* f = std::fopen(bad_path.c_str(), "wb");
             assert(f);
             const uint8_t garbage[] = {'L', 'L', 'C', 'K', 1, 0, 0, 0};
@@ -782,7 +784,7 @@ int main() {
 
         // Corrupt file: wrong magic (should fail gracefully).
         {
-            const std::string bad_path = std::string(tmpdir) + "/badmagic.bin";
+            const std::string bad_path = tmpdir + "/badmagic.bin";
             FILE* f = std::fopen(bad_path.c_str(), "wb");
             assert(f);
             const uint8_t buf[28] = {'X', 'X', 'X', 'X', 1, 0, 0, 0,
