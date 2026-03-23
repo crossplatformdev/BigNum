@@ -167,11 +167,14 @@ jobs:
           ./bin/sequence_powermod 20 1 1
           echo "Binary OK."
 
+      - name: Compress binary
+        run: gzip -9 bin/sequence_powermod
+
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4
         with:
           name: seqmod-binary-epoch${{ inputs.run_epoch }}
-          path: bin/sequence_powermod
+          path: bin/sequence_powermod.gz
           retention-days: 1
 
   # ─────────────────────────────────────────────────────────────────────────────
@@ -274,7 +277,7 @@ jobs:
           path: bin/
 
       - name: Make binary executable
-        run: chmod +x bin/sequence_powermod
+        run: gunzip bin/sequence_powermod.gz && chmod +x bin/sequence_powermod
 
       - name: Install GMP runtime
         run: |
