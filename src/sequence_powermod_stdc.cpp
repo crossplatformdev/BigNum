@@ -137,6 +137,7 @@ static size_t bitlen(const Limbs& a) {
 // Uses comba_sqr_adx (MULX+ADCX/ADOX) when available, otherwise scalar Comba.
 
 // Forward declarations (defined in the Karatsuba section below).
+static void comba_sqr_raw(const uint64_t* a, size_t n, uint64_t* out);
 #if defined(__BMI2__) && defined(__ADX__) && defined(__x86_64__)
 static constexpr size_t ADX_MIN_N = 4;
 [[gnu::target("bmi2,adx")]]
@@ -156,43 +157,8 @@ static void square_comba(const Limbs& a, Limbs& out) {
     }
 #endif
 
-    for (size_t i = 0; i < n; ++i) {
-        // Diagonal: a[i]^2 → accumulate at position 2i
-        {
-            __uint128_t carry = static_cast<__uint128_t>(a[i]) * a[i];
-            for (size_t k = 2 * i; carry; ++k) {
-                carry += out[k];
-                out[k] = static_cast<uint64_t>(carry);
-                carry >>= 64;
-            }
-        }
-        // Cross terms: 2 * a[i] * a[j] for j > i → position i+j
-        for (size_t j = i + 1; j < n; ++j) {
-            // prod = a[i] * a[j], fits in 128 bits.
-            // 2*prod fits in 129 bits: split into 64-bit hi/lo before doubling.
-            const __uint128_t prod     = static_cast<__uint128_t>(a[i]) * a[j];
-            const uint64_t    prod_lo  = static_cast<uint64_t>(prod);
-            const uint64_t    prod_hi  = static_cast<uint64_t>(prod >> 64);
-            const uint64_t    cross_lo  = prod_lo << 1;
-            const uint64_t    cross_mid = (prod_hi << 1) | (prod_lo >> 63);
-            const uint64_t    cross_top = prod_hi >> 63;  // 0 or 1
-
-            size_t k = i + j;
-            __uint128_t carry = static_cast<__uint128_t>(out[k]) + cross_lo;
-            out[k] = static_cast<uint64_t>(carry);
-            carry  = (carry >> 64) + static_cast<__uint128_t>(out[k + 1]) + cross_mid;
-            out[k + 1] = static_cast<uint64_t>(carry);
-            carry = (carry >> 64) + cross_top;
-            k += 2;
-            while (carry) {
-                carry += out[k];
-                out[k] = static_cast<uint64_t>(carry);
-                carry >>= 64;
-                ++k;
-            }
-        }
-    }
-
+    // Portable fallback: delegate to the single reference implementation.
+    comba_sqr_raw(a.data(), n, out.data());
     normalize(out);
 }
 
@@ -211,9 +177,9 @@ static void square_comba(const Limbs& a, Limbs& out) {
 // ALL per-call heap allocations.  The workspace is allocated once per
 // is_sequence_zero() call and reused across all n iterations.
 //
-// Performance table (64-bit limbs, KARA_THRESHOLD = 20):
+// Performance table (64-bit limbs, KARA_THRESHOLD = 10):
 //   p        limbs  Comba mul-ops  Kara mul-ops  speedup
-//   ≈ 1280     20      200           200           1.0× (threshold)
+//   ≈  640     10       50            50           1.0× (threshold)
 //   ≈ 3000     47     1128           742           1.52×
 //   ≈ 6000     94     4465          2226           2.01×
 
@@ -790,7 +756,7 @@ static bool is_sequence_zero(int n) {
     // The workspace buffer ws_buf is allocated ONCE before the loop and reused
     // across all n iterations; the raw kara_sqr_raw API never touches the heap.
     //
-    // Measured speedup vs old Comba 2-sqr+1-mul (KARA_THRESHOLD=20, -O3):
+    // Measured speedup vs old Comba 2-sqr+1-mul (KARA_THRESHOLD=10, -O3):
     //   p≈3000 (47 limbs):  4465 → 2226 Comba-muls/iter  ≈ 2.0× faster
     //   p≈6000 (94 limbs):  4×   …                       ≈ 2.0× faster
     const Limbs m_mask = mersenne_mask(n);

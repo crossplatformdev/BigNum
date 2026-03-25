@@ -85,7 +85,7 @@ seqmod: $(SEQMOD_BIN)
 
 # ── seqmod-prof ──────────────────────────────────────────────────────────────
 # Build a gprof-instrumented seqmod binary, run a representative benchmark
-# (n=3000..3300, 1 thread), and emit a flat+callgraph report to
+# (n=3000..3299, 1 thread), and emit a flat+callgraph report to
 # seqmod_prof_report.txt.  Use:  make seqmod-prof
 SEQMOD_PROF_BIN     := bin/sequence_powermod_prof
 SEQMOD_PROF_CXXFLAGS := -std=c++17 -O2 -march=native -pthread -pg -Wall -Wextra
@@ -111,7 +111,6 @@ seqmod-prof: $(SEQMOD_PROF_BIN)
 # Usage:  make seqmod-bench [SEQMOD_BENCH_ITERS=N] [SEQMOD_BENCH_START=P]
 SEQMOD_BENCH_ITERS ?= 1000
 SEQMOD_BENCH_START ?= 3000
-SEQMOD_GMP_BIN     := bin/sequence_powermod_gmp
 
 seqmod-bench: $(SEQMOD_BIN)
 	@echo "=== seqmod-bench: $(SEQMOD_BENCH_ITERS) candidates from n=$(SEQMOD_BENCH_START) ==="
@@ -313,7 +312,7 @@ callgrind-run: $(CALLGRIND_BIN)
 	    ./$(CALLGRIND_BIN) $(BENCH_START_INDEX) 1
 
 clean:
-	rm -rf bin prof_report.txt gmon.out perf.data callgrind.out discover_out seqmod_out seqmod_prof_report.txt
+	rm -rf bin prof_report.txt gmon.out perf.data callgrind.out discover_out seqmod_out
 
 # ---------------------------------------------------------------------------
 # microbench: FFT Lucas–Lehmer microbenchmark for a single large exponent.
