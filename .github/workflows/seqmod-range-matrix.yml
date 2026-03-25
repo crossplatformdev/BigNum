@@ -174,8 +174,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
-      batch_matrix: ${{ steps.make-matrix.outputs.batch_matrix }}
-      batch_count:  ${{ steps.make-matrix.outputs.batch_count }}
+      batch_matrix:     ${{ steps.make-matrix.outputs.batch_matrix }}
+      batch_count:      ${{ steps.make-matrix.outputs.batch_count }}
+      plan_elapsed_sec: ${{ steps.make-matrix.outputs.plan_elapsed_sec }}
     steps:
       - name: Enumerate primes and build matrix
         id: make-matrix
@@ -190,6 +191,8 @@ jobs:
           echo "Range  : [${LOW}, ${HIGH}]"
           echo "Workers: ${WORKERS}"
           echo "Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          PLAN_START=$(date +%s)
 
           python3 - <<'PYEOF'
           import json, math, os, sys
@@ -304,6 +307,22 @@ jobs:
               gh_out.write(f"batch_matrix={matrix_json}\n")
               gh_out.write(f"batch_count={len(batches)}\n")
           PYEOF
+
+          PLAN_ELAPSED=$(( $(date +%s) - PLAN_START ))
+          echo "plan_elapsed_sec=${PLAN_ELAPSED}" >> "$GITHUB_OUTPUT"
+
+          # Write step summary showing plan duration (warm-up time).
+          # Visible in both dry_run (planning) and normal run modes.
+          {
+            echo "## 📋 Planning Summary"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Range | [${LOW}, ${HIGH}] |"
+            echo "| Workers | ${WORKERS} |"
+            echo "| Dry run | ${{ inputs.dry_run }} |"
+            echo "| Planning time (warm-up) | ${PLAN_ELAPSED} s |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # ──────────────────────────────────────────────────────────
   # Stage 4: Workers – one job per batch (up to 256 parallel).
@@ -486,7 +505,7 @@ jobs:
   # ──────────────────────────────────────────────────────────
   merge:
     name: Merge results and write report
-    needs: worker
+    needs: [worker, plan]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -556,6 +575,7 @@ jobs:
             echo "| Workers requested | ${{ inputs.workers }} |"
             echo "| Threads per worker | ${{ inputs.threads }} |"
             echo "| Per-worker time limit | ${{ inputs.time_limit_seconds }} s |"
+            echo "| Planning time (warm-up) | ${{ needs.plan.outputs.plan_elapsed_sec }} s |"
             echo "| Total prime exponents tested | ${TOTAL} |"
             echo "| Mersenne primes found | ${PRIMES} |"
             echo "| Workers that timed out | ${TIMEOUTS} |"
