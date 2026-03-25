@@ -98,7 +98,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install toolchain
         run: |
@@ -112,7 +112,7 @@ jobs:
         run: make plan-tool
 
       - name: Upload binaries
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: range-sweep-binaries
           path: |
@@ -132,10 +132,10 @@ jobs:
       batch_count:  ${{ steps.build-matrix.outputs.batch_count }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Download binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           name: range-sweep-binaries
           path: bin/
@@ -217,10 +217,10 @@ jobs:
         include: ${{ fromJson(needs.plan.outputs.batch_matrix) }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Download binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           name: range-sweep-binaries
           path: bin/
@@ -258,7 +258,7 @@ jobs:
 
       - name: Upload batch results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.worker_name }}-results
           path: batch_out/${{ matrix.worker_name }}.csv
@@ -276,7 +276,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Download all batch results
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v6
         with:
           pattern: range-batch-*-results
           path: batch_artifacts/
@@ -312,7 +312,7 @@ jobs:
 
       - name: Upload merged results artifact
         if: hashFiles('merged_results.zip') != ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: range-sweep-merged-results
           path: merged_results.zip
