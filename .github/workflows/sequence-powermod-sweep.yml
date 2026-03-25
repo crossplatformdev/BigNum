@@ -768,7 +768,7 @@ jobs:
           mv merged_out/sorted.csv merged_out/merged_results.csv
 
           TOTAL=$(( $(wc -l < merged_out/merged_results.csv) - 1 ))
-          PRIMES=$(grep -c ",true$" merged_out/merged_results.csv || echo 0)
+          PRIMES=$(grep -c ",true$" merged_out/merged_results.csv || true)
           echo "Total candidates tested : ${TOTAL}"
           echo "Mersenne primes found   : ${PRIMES}"
 
@@ -784,7 +784,8 @@ jobs:
           set -euo pipefail
 
           TOTAL=$(( $(wc -l < merged_out/merged_results.csv 2>/dev/null || echo 1) - 1 ))
-          PRIMES=$(grep -c ",true$" merged_out/merged_results.csv 2>/dev/null || echo 0)
+          PRIMES=$(grep -c ",true$" merged_out/merged_results.csv 2>/dev/null || true)
+          PRIMES=${PRIMES:-0}
           TIMEOUTS=$(python3 - <<'PYEOF'
           import json, pathlib, sys
           states_dir = pathlib.Path("states")
