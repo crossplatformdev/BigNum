@@ -14,18 +14,18 @@ CALLGRIND_BIN := bin/bignum_callgrind
 PLAN_BIN := bin/split_bucket_batches
 PLAN_SRC := src/split_bucket_batches.c
 
-# seqmod_assembler: pure-C11, stdlib+pthreads only Mersenne tester.
-# Implements a(n)=(2+√3)^(2^n) via the Lucas-Lehmer recurrence,
-# with Comba squaring, Mersenne folding reduction, and a persistent
-# thread pool (zero allocation in the hot loop).
-# Reference and small-exponent benchmark; bin/bignum (FFT) is faster
-# for large exponents and remains the production binary.
-SEQMOD_ASM_SRC        := src/seqmod_assembler.c
-SEQMOD_ASM_BIN        := bin/seqmod_assembler
-SEQMOD_ASM_PROF_BIN   := bin/seqmod_assembler_prof
-SEQMOD_ASM_CFLAGS     := -std=c11 -O3 -march=native -mtune=native -pthread -Wall -Wextra
-SEQMOD_ASM_LDFLAGS    := -pthread -lm
-SEQMOD_ASM_PROF_CFLAGS := -std=c11 -O2 -march=native -pthread -pg -Wall -Wextra
+# seqmod_assembler: BigNum-backed Mersenne primality tester.
+# Implements the a(n)=(2+√3)^(2^n) criterion (≡ Lucas–Lehmer for M_p).
+# Delegates ALL arithmetic to mersenne::lucas_lehmer() from BigNum.cpp
+# (auto-selects GenericBackend / LimbBackend / FftMersenneBackend).
+# BigNum.cpp is compiled with -DBIGNUM_NO_MAIN to suppress its own main().
+# No duplicate big-integer code; inherits all of BigNum's optimisations.
+SEQMOD_ASM_SRC          := src/seqmod_assembler.cpp
+SEQMOD_ASM_BIN          := bin/seqmod_assembler
+SEQMOD_ASM_PROF_BIN     := bin/seqmod_assembler_prof
+SEQMOD_ASM_CXXFLAGS     := -std=c++20 -O3 -march=native -mtune=native -flto -pthread -Wall -Wextra -Wpedantic
+SEQMOD_ASM_LDFLAGS      := -flto -pthread
+SEQMOD_ASM_PROF_CXXFLAGS := -std=c++20 -O2 -march=native -pthread -pg -Wall -Wextra
 
 # sequence_powermod: stdlib-only Mersenne sequence search binary (no GMP).
 # Benchmarked 2.57× slower than the GMP build; kept as reference only.
@@ -99,15 +99,15 @@ seqmod: $(SEQMOD_BIN)
 # seqmod-gmp: build the GMP-based comparison binary.
 seqmod-gmp: $(SEQMOD_GMP_BIN)
 
-$(SEQMOD_ASM_BIN): $(SEQMOD_ASM_SRC)
+$(SEQMOD_ASM_BIN): $(SEQMOD_ASM_SRC) $(SRC)
 	@mkdir -p bin
-	$(CC) $(SEQMOD_ASM_CFLAGS) $< -o $@ $(SEQMOD_ASM_LDFLAGS)
+	$(CXX) $(SEQMOD_ASM_CXXFLAGS) -DBIGNUM_NO_MAIN $(SRC) $(SEQMOD_ASM_SRC) -o $@ $(SEQMOD_ASM_LDFLAGS)
 
-$(SEQMOD_ASM_PROF_BIN): $(SEQMOD_ASM_SRC)
+$(SEQMOD_ASM_PROF_BIN): $(SEQMOD_ASM_SRC) $(SRC)
 	@mkdir -p bin
-	$(CC) $(SEQMOD_ASM_PROF_CFLAGS) $< -o $@ $(SEQMOD_ASM_LDFLAGS)
+	$(CXX) $(SEQMOD_ASM_PROF_CXXFLAGS) -DBIGNUM_NO_MAIN $(SRC) $(SEQMOD_ASM_SRC) -o $@ -pthread -pg
 
-# seqmod-asm: build the pure-C seqmod_assembler binary (no GMP, no Boost).
+# seqmod-asm: build the BigNum-backed seqmod_assembler binary.
 seqmod-asm: $(SEQMOD_ASM_BIN)
 
 # seqmod-asm-prof: build with -pg for gprof profiling.
