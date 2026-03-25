@@ -146,30 +146,35 @@ static std::vector<int> find_sequence(
     start_n     = std::max(2, start_n);
     prime_count = std::max(0, prime_count);
 
-    // Pre-sieve to build an ordered list of exactly `prime_count` prime
-    // candidates starting from start_n.  This eliminates any per-candidate
-    // primality check overhead in the hot loop.
-    // Upper-bound estimate uses Rosser's inequality:
-    //   p_n < n*(ln n + ln ln n + 2) for n >= 6.
+    // Sieve of Eratosthenes — grow the bound until exactly `prime_count`
+    // primes at or above `start_n` have been collected.  We start with the
+    // Rosser upper-bound estimate and double it on each retry; this is O(1)
+    // retries in practice and never silently returns fewer primes than asked.
     std::vector<int> prime_candidates;
     if (prime_count > 0) {
-        const double ln_s = std::log(static_cast<double>(std::max(start_n, 6)));
-        const int sieve_bound = static_cast<int>(
-            start_n + prime_count * (ln_s + std::log(ln_s) + 3.0) + 200);
-        std::vector<uint8_t> sieve(static_cast<size_t>(sieve_bound + 1), 1);
-        sieve[0] = 0;
-        if (sieve_bound >= 1) sieve[1] = 0;
-        for (int p = 2; 1LL * p * p <= sieve_bound; ++p) {
-            if (!sieve[static_cast<size_t>(p)]) continue;
-            for (int m = p * p; m <= sieve_bound; m += p)
-                sieve[static_cast<size_t>(m)] = 0;
+        const double ln_pc = std::log(static_cast<double>(std::max(prime_count, 6)));
+        int sieve_bound = static_cast<int>(
+            start_n + prime_count * (ln_pc + std::log(ln_pc) + 3.0) + 200);
+
+        while (static_cast<int>(prime_candidates.size()) < prime_count) {
+            prime_candidates.clear();
+            std::vector<uint8_t> sieve(static_cast<size_t>(sieve_bound + 1), 1);
+            sieve[0] = 0;
+            if (sieve_bound >= 1) sieve[1] = 0;
+            for (int p = 2; 1LL * p * p <= sieve_bound; ++p) {
+                if (!sieve[static_cast<size_t>(p)]) continue;
+                for (int m = p * p; m <= sieve_bound; m += p)
+                    sieve[static_cast<size_t>(m)] = 0;
+            }
+            prime_candidates.reserve(static_cast<size_t>(prime_count));
+            for (int n = start_n; n <= sieve_bound; ++n) {
+                if (sieve[static_cast<size_t>(n)])
+                    prime_candidates.push_back(n);
+            }
+            if (static_cast<int>(prime_candidates.size()) < prime_count)
+                sieve_bound *= 2;
         }
-        prime_candidates.reserve(static_cast<size_t>(prime_count));
-        for (int n = start_n; n <= sieve_bound &&
-             static_cast<int>(prime_candidates.size()) < prime_count; ++n) {
-            if (sieve[static_cast<size_t>(n)])
-                prime_candidates.push_back(n);
-        }
+        prime_candidates.resize(static_cast<size_t>(prime_count));
     }
     const int actual_prime_count = static_cast<int>(prime_candidates.size());
 

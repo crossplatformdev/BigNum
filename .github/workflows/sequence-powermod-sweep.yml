@@ -442,7 +442,8 @@ jobs:
           STATE_PATH="worker_out/${{ matrix.worker_name }}_state.json"
 
           set +e
-          LL_SWEEP_MODE=p \
+          timeout "${{ inputs.time_limit_seconds }}" \
+          env LL_SWEEP_MODE=p \
           LL_MIN_EXPONENT="${{ matrix.worker_start_n }}" \
           LL_MAX_EXPONENT="${{ matrix.worker_end_n }}" \
           LL_BENCH_OUTPUT="${CSV_PATH}" \
@@ -450,6 +451,9 @@ jobs:
           ./bin/bignum 0 "${{ inputs.threads }}"
           EXIT_CODE=$?
           set -e
+          # exit 124 = timeout(1) killed the process — treat as timed out
+          # (same convention as the old seqmod exit 42 soft-stop).
+          [ "${EXIT_CODE}" -eq 124 ] && EXIT_CODE=42
 
           echo "Binary exit code: ${EXIT_CODE}"
           echo "exit_code=${EXIT_CODE}" >> "$GITHUB_OUTPUT"
@@ -752,13 +756,14 @@ jobs:
           set -euo pipefail
           mkdir -p merged_out/
 
-          echo "n,is_prime" > merged_out/merged_results.csv
+          # bignum LL_BENCH_OUTPUT format: p,is_prime,time_sec
+          echo "p,is_prime,time_sec" > merged_out/merged_results.csv
 
           for f in results/*.csv; do
             [ -f "$f" ] && tail -n +2 "$f" >> merged_out/merged_results.csv || true
           done
 
-          # Sort by n (numeric ascending), keeping header.
+          # Sort by p (numeric ascending), keeping header.
           {
             head -1 merged_out/merged_results.csv
             tail -n +2 merged_out/merged_results.csv | sort -t, -k1 -n
@@ -766,7 +771,7 @@ jobs:
           mv merged_out/sorted.csv merged_out/merged_results.csv
 
           TOTAL=$(( $(wc -l < merged_out/merged_results.csv) - 1 ))
-          PRIMES=$(grep -c ",true$" merged_out/merged_results.csv || true)
+          PRIMES=$(grep -c ",true," merged_out/merged_results.csv || true)
           echo "Total candidates tested : ${TOTAL}"
           echo "Mersenne primes found   : ${PRIMES}"
 
@@ -782,7 +787,7 @@ jobs:
           set -euo pipefail
 
           TOTAL=$(( $(wc -l < merged_out/merged_results.csv 2>/dev/null || echo 1) - 1 ))
-          PRIMES=$(grep -c ",true$" merged_out/merged_results.csv 2>/dev/null || true)
+          PRIMES=$(grep -c ",true," merged_out/merged_results.csv 2>/dev/null || true)
           PRIMES=${PRIMES:-0}
           TIMEOUTS=$(python3 - <<'PYEOF'
           import json, pathlib, sys
@@ -822,8 +827,8 @@ jobs:
               echo ""
               echo "| Exponent p | M_p = 2^p − 1 |"
               echo "|------------|---------------|"
-              grep ",true$" merged_out/merged_results.csv 2>/dev/null | \
-                while IFS=, read -r p _; do
+              grep ",true," merged_out/merged_results.csv 2>/dev/null | \
+                while IFS=, read -r p _rest; do
                   echo "| ${p} | M_${p} |"
                 done
             fi

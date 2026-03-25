@@ -152,7 +152,8 @@ jobs:
 
           START_SEC=$(date +%s)
           set +e
-          LL_SWEEP_MODE=p \
+          timeout "${{ inputs.time_limit_seconds }}" \
+          env LL_SWEEP_MODE=p \
           LL_MIN_EXPONENT="${P_MIN}" \
           LL_MAX_EXPONENT="${P_MAX}" \
           LL_BENCH_OUTPUT="${CSV_PATH}" \
@@ -160,6 +161,8 @@ jobs:
           ./bin/bignum 0 4
           EXIT_CODE=$?
           set -e
+          # exit 124 means timeout(1) killed the process — treat as timed out.
+          [ "${EXIT_CODE}" -eq 124 ] && EXIT_CODE=42
           ELAPSED=$(( $(date +%s) - START_SEC ))
 
           echo "Exit code : ${EXIT_CODE}"
