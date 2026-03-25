@@ -1,5 +1,5 @@
 name: LL 4-Prime Worker
-run-name: "LL · p=${{ inputs.p1 }}${{ inputs.p2 != '' && format(', {0}', inputs.p2) || '' }}${{ inputs.p3 != '' && format(', {0}', inputs.p3) || '' }}${{ inputs.p4 != '' && format(', {0}', inputs.p4) || '' }}"
+run-name: "LL · p=${{ inputs.p1 }}, ${{ inputs.p2 || 'N/A' }}, ${{ inputs.p3 || 'N/A' }}, ${{ inputs.p4 || 'N/A' }}"
 
 # Single-run Lucas-Lehmer test for a batch of up to 4 prime exponents.
 #
@@ -65,7 +65,7 @@ env:
 
 jobs:
   worker:
-    name: "LL p=${{ inputs.p1 }}${{ inputs.p2 != '' && format(', {0}', inputs.p2) || '' }}${{ inputs.p3 != '' && format(', {0}', inputs.p3) || '' }}${{ inputs.p4 != '' && format(', {0}', inputs.p4) || '' }}"
+    name: "LL p=${{ inputs.p1 }}, ${{ inputs.p2 || 'N/A' }}, ${{ inputs.p3 || 'N/A' }}, ${{ inputs.p4 || 'N/A' }}"
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     env:
@@ -174,7 +174,7 @@ jobs:
           M_LABELS=$(echo "${MERSENNE_EXPS}" | tr ' ' '\n' | awk '{printf "%sM_%s", (NR>1 ? ", " : ""), $1}' | tr -d '\n')
 
           # Build the new display title for this action run.
-          PRIMES_PART="p=${{ inputs.p1 }}${{ inputs.p2 != '' && format(', {0}', inputs.p2) || '' }}${{ inputs.p3 != '' && format(', {0}', inputs.p3) || '' }}${{ inputs.p4 != '' && format(', {0}', inputs.p4) || '' }}"
+          PRIMES_PART="p=${{ inputs.p1 }}, ${{ inputs.p2 || 'N/A' }}, ${{ inputs.p3 || 'N/A' }}, ${{ inputs.p4 || 'N/A' }}"
           NEW_TITLE="🎉 MERSENNE PRIME ${M_LABELS} · LL · ${PRIMES_PART}"
 
           echo "Renaming run to: ${NEW_TITLE}"
@@ -225,7 +225,7 @@ jobs:
             echo ""
             echo "| Field | Value |"
             echo "|-------|-------|"
-            echo "| Primes | p=${{ inputs.p1 }}${{ inputs.p2 != '' && format(', {0}', inputs.p2) || '' }}${{ inputs.p3 != '' && format(', {0}', inputs.p3) || '' }}${{ inputs.p4 != '' && format(', {0}', inputs.p4) || '' }} |"
+            echo "| Primes | p=${{ inputs.p1 }}, ${{ inputs.p2 || 'N/A' }}, ${{ inputs.p3 || 'N/A' }}, ${{ inputs.p4 || 'N/A' }} |"
             echo "| Elapsed time | ${ELAPSED_FMT} |"
             echo "| Status | ${STATUS_LABEL} |"
             echo "| Workflow run | [${GITHUB_RUN_ID}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}) |"
