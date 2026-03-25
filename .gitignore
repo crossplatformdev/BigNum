@@ -8,3 +8,4 @@ scripts/__pycache__
 tests/__pycache__
 __pycache__
 build
+seqmod_prof_report.txt

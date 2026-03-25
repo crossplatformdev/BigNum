@@ -68,7 +68,7 @@ PERF_LDFLAGS  := -pthread
 CALLGRIND_CXXFLAGS := -std=c++20 -O2 -g -fno-omit-frame-pointer -march=native -mtune=native -pthread -Wall -Wextra -Wpedantic
 CALLGRIND_LDFLAGS  := -pthread
 
-.PHONY: all clean unit smoke regression test bench bench-ci cluster-power prof perf-build callgrind-build perf-run callgrind-run discover discover-dry-run manual-sweep bucket bucket-dry-run plan-tool seqmod seqmod-asm seqmod-asm-prof seqmod-asm-bench
+.PHONY: all clean unit smoke regression test bench bench-ci cluster-power prof perf-build callgrind-build perf-run callgrind-run discover discover-dry-run manual-sweep bucket bucket-dry-run plan-tool seqmod seqmod-prof seqmod-bench seqmod-asm seqmod-asm-prof seqmod-asm-bench
 
 BENCH_START_INDEX ?= 14
 
@@ -96,6 +96,53 @@ $(SEQMOD_GMP_BIN): $(SEQMOD_GMP_SRC)
 # seqmod: build the stdlib-only reference binary (no GMP).
 seqmod: $(SEQMOD_BIN)
 
+# ── seqmod-prof ──────────────────────────────────────────────────────────────
+# Build a gprof-instrumented seqmod binary, run a representative benchmark
+# (n=3000..3299, 1 thread), and emit a flat+callgraph report to
+# seqmod_prof_report.txt.  Use:  make seqmod-prof
+SEQMOD_PROF_BIN     := bin/sequence_powermod_prof
+SEQMOD_PROF_CXXFLAGS := -std=c++17 -O2 -march=native -pthread -pg -Wall -Wextra
+SEQMOD_PROF_LDFLAGS  := -pthread -pg
+SEQMOD_PROF_ITERS   ?= 300
+SEQMOD_PROF_START   ?= 3000
+
+$(SEQMOD_PROF_BIN): $(SEQMOD_SRC)
+	@mkdir -p bin
+	$(CXX) $(SEQMOD_PROF_CXXFLAGS) $< -o $@ $(SEQMOD_PROF_LDFLAGS)
+
+seqmod-prof: $(SEQMOD_PROF_BIN)
+	@echo "=== seqmod-prof: running $(SEQMOD_PROF_ITERS) candidates from n=$(SEQMOD_PROF_START) ==="
+	./$(SEQMOD_PROF_BIN) $(SEQMOD_PROF_ITERS) $(SEQMOD_PROF_START) 1
+	@echo "=== Generating gprof report → seqmod_prof_report.txt ==="
+	gprof $(SEQMOD_PROF_BIN) gmon.out > seqmod_prof_report.txt
+	@echo "--- Top 25 functions (flat profile) ---"
+	head -50 seqmod_prof_report.txt
+
+# ── seqmod-bench ─────────────────────────────────────────────────────────────
+# Compare the stdlib-only seqmod against the GMP-based seqmod_gmp binary for a
+# given exponent range.  Prints wall-clock time for both, plus speedup ratio.
+# Usage:  make seqmod-bench [SEQMOD_BENCH_ITERS=N] [SEQMOD_BENCH_START=P]
+SEQMOD_BENCH_ITERS ?= 1000
+SEQMOD_BENCH_START ?= 3000
+
+seqmod-bench: $(SEQMOD_BIN)
+	@echo "=== seqmod-bench: $(SEQMOD_BENCH_ITERS) candidates from n=$(SEQMOD_BENCH_START) ==="
+	@echo ""
+	@echo "--- stdlib-only (Karatsuba + 3-squaring, no GMP) ---"
+	@START=$$(date +%s%N); \
+	 ./$(SEQMOD_BIN) $(SEQMOD_BENCH_ITERS) $(SEQMOD_BENCH_START) 1 2>/dev/null; \
+	 END=$$(date +%s%N); \
+	 echo "  seqmod_stdc: $$(( (END - START) / 1000000 )) ms"
+	@if [ -x $(SEQMOD_GMP_BIN) ]; then \
+	   echo ""; \
+	   echo "--- GMP-based (reference) ---"; \
+	   START=$$(date +%s%N); \
+	   ./$(SEQMOD_GMP_BIN) $(SEQMOD_BENCH_ITERS) $(SEQMOD_BENCH_START) 1 2>/dev/null; \
+	   END=$$(date +%s%N); \
+	   echo "  seqmod_gmp:  $$(( (END - START) / 1000000 )) ms"; \
+	 else \
+	   echo "(GMP binary $(SEQMOD_GMP_BIN) not found; build with GMP to compare)"; \
+	 fi
 # seqmod-gmp: build the GMP-based comparison binary.
 seqmod-gmp: $(SEQMOD_GMP_BIN)
 
