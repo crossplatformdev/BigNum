@@ -71,16 +71,16 @@ jobs:
       - name: Install toolchain
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq g++ make
+          sudo apt-get install -y -qq g++ make libboost-dev
 
-      - name: Build sequence_powermod
-        run: make seqmod SEQMOD_CXXFLAGS="-std=c++17 -O3 -march=x86-64 -pthread -Wall -Wextra"
+      - name: Build bignum
+        run: make bin/bignum
 
       - name: Verify binary
         run: |
           echo "=== Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} ==="
           echo "Job: worker"
-          ./bin/sequence_powermod 20 1 1
+          LL_SWEEP_MODE=p LL_MIN_EXPONENT=2 LL_MAX_EXPONENT=5 ./bin/bignum 0 1
           echo "Binary OK."
 
       - name: Run Lucas-Lehmer test
@@ -143,7 +143,7 @@ jobs:
 
           DRY_RUN="${{ inputs.dry_run }}"
           if [ "${DRY_RUN}" = "true" ]; then
-            echo "DRY RUN: would run sequence_powermod on [${P_MIN}, ${P_MAX}] (${ITERS} candidates)"
+          echo "DRY RUN: would run bignum on [${P_MIN}, ${P_MAX}]"
             echo "exit_code=0"    >> "$GITHUB_OUTPUT"
             echo "elapsed_secs=0" >> "$GITHUB_OUTPUT"
             echo "csv_path="      >> "$GITHUB_OUTPUT"
@@ -152,10 +152,12 @@ jobs:
 
           START_SEC=$(date +%s)
           set +e
-          SEQMOD_TIME_LIMIT_SECS="${{ inputs.time_limit_seconds }}" \
-          SEQMOD_OUTPUT_CSV="${CSV_PATH}" \
-          SEQMOD_STATE_FILE="${STATE_PATH}" \
-          ./bin/sequence_powermod "${ITERS}" "${P_MIN}" "4"
+          LL_SWEEP_MODE=p \
+          LL_MIN_EXPONENT="${P_MIN}" \
+          LL_MAX_EXPONENT="${P_MAX}" \
+          LL_BENCH_OUTPUT="${CSV_PATH}" \
+          LL_PROGRESS=0 \
+          ./bin/bignum 0 4
           EXIT_CODE=$?
           set -e
           ELAPSED=$(( $(date +%s) - START_SEC ))
@@ -186,7 +188,8 @@ jobs:
           fi
 
           # Collect all exponents whose is_prime column is "true".
-          MERSENNE_EXPS=$(grep -E "^[0-9]+,true$" "${CSV_PATH}" | cut -d, -f1 | tr '\n' ' ' | sed 's/ $//' || true)
+          # bignum LL_BENCH_OUTPUT CSV format: p,is_prime,time_sec
+          MERSENNE_EXPS=$(grep -E ",true," "${CSV_PATH}" | cut -d, -f1 | tr '\n' ' ' | sed 's/ $//' || true)
 
           if [ -z "${MERSENNE_EXPS}" ]; then
             echo "No Mersenne primes found in this batch – run name unchanged."

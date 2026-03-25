@@ -535,11 +535,12 @@ struct Results {
 };
 
 // ─── Main sweep function ───────────────────────────────────────────────────────
-// Returns the list of Mersenne-prime exponents found in [start_n, start_n+iterations-1].
-// collect_rows   – add every candidate to `results` for CSV output.
+// Returns the list of Mersenne-prime exponents found among the next
+// `prime_count` primes at or above start_n.
+// collect_rows   – add every result to `results` for CSV output.
 // track_dispatch – maintain last_dispatched_n for safe soft-stop resume.
 static std::vector<int> find_sequence(
-    int          iterations,
+    int          prime_count,
     int          start_n,
     uint32_t     parallel_threads,
     long long    time_limit_secs,
@@ -548,34 +549,33 @@ static std::vector<int> find_sequence(
     Results&     results,
     int&         out_last_dispatched_n)
 {
-    start_n    = std::max(1, start_n);
-    iterations = std::max(0, iterations);
+    start_n     = std::max(2, start_n);
+    prime_count = std::max(0, prime_count);
 
-    const int end_n = start_n + iterations - 1;
-
-    // Sieve of Eratosthenes; then collect only prime candidates.
-    // M_p = 2^p − 1 can only be prime when p itself is prime, so composite
-    // exponents are skipped entirely — no work item is created for them.
-    std::vector<uint8_t> prime_flags(static_cast<size_t>(iterations), 0);
-    std::vector<int>     prime_candidates;           // packed list of prime n values
-    if (iterations > 0) {
-        std::vector<uint8_t> sieve(static_cast<size_t>(end_n + 1), 1);
+    // Sieve of Eratosthenes over a generous upper bound to collect exactly
+    // `prime_count` prime candidates starting from start_n.
+    // Upper-bound estimate uses Rosser's inequality:
+    //   p_n < n*(ln n + ln ln n + 2) for n >= 6.
+    std::vector<int> prime_candidates;
+    if (prime_count > 0) {
+        const double ln_s = std::log(static_cast<double>(std::max(start_n, 6)));
+        const int sieve_bound = static_cast<int>(
+            start_n + prime_count * (ln_s + std::log(ln_s) + 3.0) + 200);
+        std::vector<uint8_t> sieve(static_cast<size_t>(sieve_bound + 1), 1);
         sieve[0] = 0;
-        if (end_n >= 1) sieve[1] = 0;
-        for (int p = 2; 1LL * p * p <= end_n; ++p) {
+        if (sieve_bound >= 1) sieve[1] = 0;
+        for (int p = 2; 1LL * p * p <= sieve_bound; ++p) {
             if (!sieve[static_cast<size_t>(p)]) continue;
-            for (int m = p * p; m <= end_n; m += p)
+            for (int m = p * p; m <= sieve_bound; m += p)
                 sieve[static_cast<size_t>(m)] = 0;
         }
-        prime_candidates.reserve(static_cast<size_t>(iterations));
-        for (int i = 0; i < iterations; ++i) {
-            prime_flags[static_cast<size_t>(i)] =
-                sieve[static_cast<size_t>(start_n + i)];
-            if (prime_flags[static_cast<size_t>(i)])
-                prime_candidates.push_back(start_n + i);
+        prime_candidates.reserve(static_cast<size_t>(prime_count));
+        for (int n = start_n; n <= sieve_bound &&
+             static_cast<int>(prime_candidates.size()) < prime_count; ++n) {
+            if (sieve[static_cast<size_t>(n)])
+                prime_candidates.push_back(n);
         }
     }
-    const int prime_count = static_cast<int>(prime_candidates.size());
 
     std::vector<int> hits;
     std::mutex       hits_mutex;
@@ -639,19 +639,6 @@ static std::vector<int> find_sequence(
         });
     }
 
-    // Helper: emit composite-n rows to CSV after workers finish.
-    // Composites never need is_sequence_zero; they are simply not Mersenne candidates.
-    // We emit up to last_dispatched_n so a soft-stop doesn't include untested composites.
-    const auto emit_composites = [&](int upto) {
-        if (!collect_rows) return;
-        const int limit = std::min(upto, end_n);
-        for (int n = start_n; n <= limit; ++n) {
-            const int i = n - start_n;
-            if (!prime_flags[static_cast<size_t>(i)])
-                results.add(n, false);
-        }
-    };
-
     // Fast path: join workers directly and skip the polling monitor.
     if (fast_mode) {
         for (std::thread& w : workers) w.join();
@@ -662,8 +649,8 @@ static std::vector<int> find_sequence(
                   << " | ETA: "  << format_duration(std::chrono::seconds(0))
                   << " | Progress: 100%" << '\n';
 
-        out_last_dispatched_n = track_dispatch ? last_dispatched_n.load() : end_n;
-        emit_composites(out_last_dispatched_n);
+        out_last_dispatched_n = track_dispatch ? last_dispatched_n.load()
+            : (prime_candidates.empty() ? start_n - 1 : prime_candidates.back());
         std::sort(hits.begin(), hits.end());
         return hits;
     }
@@ -707,8 +694,8 @@ static std::vector<int> find_sequence(
 
     for (std::thread& w : workers) w.join();
 
-    out_last_dispatched_n = track_dispatch ? last_dispatched_n.load() : end_n;
-    emit_composites(out_last_dispatched_n);
+    out_last_dispatched_n = track_dispatch ? last_dispatched_n.load()
+        : (prime_candidates.empty() ? start_n - 1 : prime_candidates.back());
     std::sort(hits.begin(), hits.end());
     return hits;
 }
@@ -856,10 +843,8 @@ int main(int argc, char* argv[]) {
         return EXIT_DONE;
     }
 
-    const int end_n = start_n + iterations - 1;
-
     std::cout << "sequence_powermod_stdc: start_n=" << start_n
-              << " end_n=" << end_n
+              << " prime_count=" << iterations
               << " threads=" << threads;
     if (time_limit_secs > 0)
         std::cout << " time_limit=" << time_limit_secs << "s";
@@ -877,7 +862,7 @@ int main(int argc, char* argv[]) {
     const bool timed_out = g_stop.load();
 
     if (csv_path   && *csv_path)   write_csv(csv_path, results);
-    if (state_path && *state_path) write_state(state_path, start_n, end_n,
+    if (state_path && *state_path) write_state(state_path, start_n, last_dispatched_n,
                                                last_dispatched_n, timed_out, hits);
 
     std::cout << "{";
