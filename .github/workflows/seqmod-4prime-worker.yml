@@ -9,7 +9,8 @@ run-name: "LL · p=${{ inputs.p1 }}, ${{ inputs.p2 || 'N/A' }}, ${{ inputs.p3 ||
 #
 # If any exponent in the batch yields a Mersenne prime, the run name is
 # updated via the GitHub API to reflect the discovery, e.g.:
-#   "🎉 MERSENNE PRIME M_p · LL · p=p1, p2, p3, p4"
+#   "🍋 LL · p=p1, p2, p3, p4"  (known prime, ≤ 136279841)
+#   "🥇 LL · p=p1, p2, p3, p4"  (new prime, > 136279841)
 #
 # Inputs:
 #   p1                 – first prime exponent (required)
@@ -233,11 +234,9 @@ jobs:
 
           primes_part = os.environ.get("PRIMES_PART", "")
           if new:
-              m_labels = ", ".join(f"M_{e}" for e in new)
-              title = f"🥇 NEW PRIME {m_labels} · LL · {primes_part}"
+              title = f"🥇 LL · {primes_part}"
           else:
-              m_labels = ", ".join(f"M_{e}" for e in known)
-              title = f"🍋 MERSENNE PRIME {m_labels} · LL · {primes_part}"
+              title = f"🍋 LL · {primes_part}"
 
           # Emit the title so the shell can capture it.
           print(f"__TITLE__:{title}")
