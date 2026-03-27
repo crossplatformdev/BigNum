@@ -43,7 +43,12 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        const unsigned long n = std::stoul(argv[1]) - 2UL;
+        const unsigned long raw = std::stoul(argv[1]);
+        if (raw < 2UL) {
+            std::cerr << "Error: n must be >= 2 (got " << raw << ")\n";
+            return 1;
+        }
+        const unsigned long n = raw - 2UL;
         const bool profile = (std::getenv("EXPR_PROFILE") != nullptr);
         using clock = std::chrono::steady_clock;
         using dsec = std::chrono::duration<double>;

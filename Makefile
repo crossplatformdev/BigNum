@@ -79,6 +79,13 @@ EXPR_MOD_GMP_LDFLAGS  := -lgmp
 
 .PHONY: all clean unit smoke regression test bench bench-ci cluster-power prof perf-build callgrind-build perf-run callgrind-run discover discover-dry-run manual-sweep bucket bucket-dry-run plan-tool seqmod seqmod-prof seqmod-bench seqmod-asm seqmod-asm-prof seqmod-asm-bench expr-mod-gmp
 
+$(EXPR_MOD_GMP_BIN): $(EXPR_MOD_GMP_SRC)
+	@mkdir -p bin
+	$(CXX) $(EXPR_MOD_GMP_CXXFLAGS) $< -o $@ $(EXPR_MOD_GMP_LDFLAGS)
+
+# expr-mod-gmp: build the standalone GMP recurrence evaluator.
+expr-mod-gmp: $(EXPR_MOD_GMP_BIN)
+
 BENCH_START_INDEX ?= 14
 
 all: $(BIN)
