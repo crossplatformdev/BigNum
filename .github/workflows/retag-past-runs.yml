@@ -72,10 +72,11 @@ jobs:
           MAX_PAGES = int(raw_max_pages)
           REPO      = os.environ['GITHUB_REPOSITORY']
 
-          renamed_count = 0
-          skipped_count = 0
-          failed_count  = 0
-          page          = 1
+          renamed_count    = 0
+          skipped_count    = 0
+          failed_count     = 0
+          not_found_count  = 0
+          page             = 1
           consecutive_errors = 0
 
           print(f"{'[DRY RUN] ' if DRY_RUN else ''}Scanning seqmod-4prime-worker.yml runs in {REPO}")
@@ -188,6 +189,12 @@ jobs:
                           err = r.stderr.strip()
                           print(f"  ⚠️  failed (attempt {attempt}/{max_attempts}): {err}")
                           lower_err = err.lower()
+                          # HTTP 404 means the run no longer exists or the API does
+                          # not support renaming it; skip without retrying or failing.
+                          if 'http 404' in lower_err or '(http 404)' in lower_err:
+                              print(f"  ℹ️  run {run_id} not found (404) – skipping.")
+                              not_found_count += 1
+                              break
                           is_rate_limited = any(
                               token in lower_err
                               for token in ('rate limit', 'secondary rate limit', 'abuse detection')
@@ -230,6 +237,8 @@ jobs:
           print(f"Runs already tagged (skipped): {skipped_count}")
           if not DRY_RUN:
               print(f"Rename failures              : {failed_count}")
+              if not_found_count > 0:
+                  print(f"Runs not found (skipped)     : {not_found_count}")
           if not DRY_RUN and failed_count > 0:
               import sys; sys.exit(1)
           PYEOF
